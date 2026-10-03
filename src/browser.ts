@@ -7,9 +7,10 @@ import {
   scrubPublicText,
   type ElementFacts,
 } from "./policy.js";
+import { hostResolverRules, type HostPin } from "./policy.js";
 import { resolveSitePaths } from "./site-path.js";
 import { preparePrivateDir } from "./session-path.js";
-import { createProfileVault } from "./vault.js";
+import { createProfileVault, relockClosedSite } from "./vault.js";
 
 export interface PageSignals {
   title: string;
@@ -28,12 +29,38 @@ export interface BrowserOps {
   blank(): Promise<void>;
 }
 
+export interface BrowserLaunchOptions {
+  /** Checked addresses to pin with Chromium --host-resolver-rules. */
+  pins?: readonly HostPin[];
+  /**
+   * When true, a pin change closes and relaunches Chrome before the operation.
+   * When false, a pin change blanks the page, locks the profile, and throws.
+   */
+  relaunch?: boolean;
+}
+
 export interface BrowserControl {
   profileExists(site: string): boolean;
   isOpen(): boolean;
   openSite(): string | null;
-  exclusive<T>(site: string, fn: (ops: BrowserOps) => Promise<T>): Promise<T>;
+  exclusive<T>(site: string, fn: (ops: BrowserOps) => Promise<T>, options?: BrowserLaunchOptions): Promise<T>;
   close(): Promise<void>;
+}
+
+export class DnsPinError extends Error {
+  readonly reason = "dns_pin_changed" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "DnsPinError";
+  }
+}
+
+/** Chromium args for a dedicated visible window. hostRules is a host-resolver-rules value. */
+export function chromeLaunchArgs(hostRules: string): string[] {
+  const args = ["--disable-sync", "--no-first-run", "--no-default-browser-check"];
+  if (hostRules.length > 0) args.push(`--host-resolver-rules=${hostRules}`);
+  return args;
 }
 
 export class BrowserPolicyError extends Error {
@@ -59,6 +86,11 @@ export function createChromeBrowser(options: {
 }): BrowserControl {
   let context: BrowserContext | null = null;
   let currentSite: string | null = null;
+  let currentRules = "";
+  let desiredRules = "";
+  // Bumped when this process closes Chrome on purpose, so the close hook does not
+  // also lock. A user closing the window leaves the epoch unchanged and relocks.
+  let epoch = 0;
   const lock = createMutex();
   const key = options.encryptionKey ?? null;
   const vault = createProfileVault(key);
@@ -85,27 +117,81 @@ export function createChromeBrowser(options: {
     return context !== null && context.browser()?.isConnected() === true;
   }
 
-  async function ensureContext(site: string): Promise<BrowserContext> {
-    if (context?.browser()?.isConnected() && currentSite === site) return context;
-    if (context) {
-      const previous = currentSite;
-      const closing = context;
-      context = null;
-      currentSite = null;
-      await closing.close().catch(() => undefined);
-      if (previous) {
-        try {
-          vault.lockSite(options.dataDir, previous);
-        } catch {
-          // The previous profile stays mode 0700 if encryption fails.
-        }
+  function lockProfile(site: string, reason: "browser_closed" | "process_exit" | "relaunch"): void {
+    try {
+      relockClosedSite(vault, options.dataDir, site, reason);
+    } catch {
+      // A failed lock leaves the directory mode 0700. The key is not logged.
+    }
+  }
+
+  async function blankOpenPage(): Promise<void> {
+    if (!context || context.browser()?.isConnected() !== true) return;
+    const page = context.pages().filter((item) => !item.isClosed())[0];
+    if (!page) return;
+    await page.goto("about:blank", { timeout: 5000 }).catch(() => undefined);
+  }
+
+  async function shutdownContext(relock: boolean): Promise<void> {
+    const closing = context;
+    const previous = currentSite;
+    if (!closing) return;
+    epoch += 1;
+    context = null;
+    currentSite = null;
+    currentRules = "";
+    await closing.close().catch(() => undefined);
+    if (relock && previous) lockProfile(previous, "browser_closed");
+  }
+
+  function watchContext(ctx: BrowserContext, site: string, epochAtLaunch: number): void {
+    ctx.on("close", () => {
+      if (context === ctx) {
+        context = null;
+        currentSite = null;
+        currentRules = "";
       }
+      // SIGKILL cannot reach this hook. Only a real browser close does.
+      if (epoch !== epochAtLaunch) return;
+      lockProfile(site, "browser_closed");
+    });
+  }
+
+  async function alignPins(site: string, pins: readonly HostPin[], relaunch: boolean): Promise<void> {
+    const desired = hostResolverRules(pins);
+    const connected = context?.browser()?.isConnected() === true;
+    if (connected && currentSite === site && currentRules === desired) {
+      desiredRules = desired;
+      return;
+    }
+    if (connected && currentSite === site && !relaunch) {
+      await blankOpenPage();
+      await shutdownContext(true);
+      throw new DnsPinError(
+        "Pinned addresses changed. The page was closed and the profile was locked. Call auth_open again.",
+      );
+    }
+    if (connected) {
+      await shutdownContext(currentSite !== site);
+    }
+    desiredRules = desired;
+  }
+
+  async function ensureContext(site: string): Promise<BrowserContext> {
+    if (context?.browser()?.isConnected() && currentSite === site && currentRules === desiredRules) {
+      return context;
+    }
+    if (context) {
+      await shutdownContext(currentSite !== site);
     }
     const paths = resolveSitePaths(options.dataDir, site);
     vault.unlockSite(options.dataDir, site);
     preparePrivateDir(paths.profile);
+    const epochAtLaunch = epoch;
+    const rulesAtLaunch = desiredRules;
+    let launched: BrowserContext;
     try {
-      context = await chromium.launchPersistentContext(paths.profile, {
+      launched = await chromium.launchPersistentContext(paths.profile, {
         channel: "chrome",
         headless: false,
         viewport: null,
@@ -115,29 +201,33 @@ export function createChromeBrowser(options: {
         handleSIGINT: false,
         handleSIGTERM: false,
         handleSIGHUP: false,
-        args: ["--disable-sync", "--no-first-run", "--no-default-browser-check"],
+        args: chromeLaunchArgs(rulesAtLaunch),
       });
     } catch (error) {
       context = null;
       currentSite = null;
+      currentRules = "";
+      lockProfile(site, "browser_closed");
       throw new Error(explainLaunchError(error, secrets));
     }
+    context = launched;
     currentSite = site;
-    context.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-    context.setDefaultTimeout(ACTION_TIMEOUT_MS);
-    context.on("close", () => {
-      context = null;
-      currentSite = null;
-    });
+    currentRules = rulesAtLaunch;
+    launched.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    launched.setDefaultTimeout(ACTION_TIMEOUT_MS);
+    watchContext(launched, site, epochAtLaunch);
     try {
       preparePrivateDir(paths.profile);
     } catch {
-      await context.close().catch(() => undefined);
+      epoch += 1;
       context = null;
       currentSite = null;
+      currentRules = "";
+      await launched.close().catch(() => undefined);
+      lockProfile(site, "browser_closed");
       throw new Error("Chrome profile directory could not be kept private.");
     }
-    return context;
+    return launched;
   }
 
   async function getPage(ctx: BrowserContext): Promise<Page> {
@@ -299,15 +389,15 @@ export function createChromeBrowser(options: {
     openSite() {
       return isOpen() ? currentSite : null;
     },
-    exclusive<T>(site: string, fn: (ops: BrowserOps) => Promise<T>): Promise<T> {
-      return lock(() => fn(createOps(site)));
+    exclusive<T>(site: string, fn: (ops: BrowserOps) => Promise<T>, launch?: BrowserLaunchOptions): Promise<T> {
+      return lock(async () => {
+        if (launch?.pins) await alignPins(site, launch.pins, launch.relaunch !== false);
+        return fn(createOps(site));
+      });
     },
     close() {
       return lock(async () => {
-        const ctx = context;
-        context = null;
-        currentSite = null;
-        if (ctx) await ctx.close().catch(() => undefined);
+        await shutdownContext(true);
         try {
           vault.lockAll(options.dataDir);
         } catch {

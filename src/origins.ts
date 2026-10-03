@@ -6,17 +6,26 @@ import { isNotFound, readPrivateJson, writePrivateJson } from "./private-file.js
 import { listSiteIds, resolveSitePaths, type SitePaths } from "./site-path.js";
 import { mayTighten } from "./session-path.js";
 
-export interface SiteRecord {
-  site: string;
+export type SessionState = "ok" | "needs_login";
+
+export interface OriginRecord {
+  loginOrigin: string | null;
+  workOrigins: string[];
   origins: string[];
+}
+
+export interface SiteRecord extends OriginRecord {
+  site: string;
   lastUsed: string | null;
+  session: SessionState;
 }
 
 export interface OriginStore {
   list(): Promise<SiteRecord[]>;
   has(site: string, origin: string): Promise<boolean>;
+  /** First origin is the login origin. Later origins are work origins. */
   confirm(site: string, origins: string[]): Promise<string[]>;
-  touch(site: string, when?: Date): Promise<string>;
+  touch(site: string, when?: Date, session?: SessionState): Promise<string>;
 }
 
 const MAX_ORIGINS = 1000;
@@ -40,32 +49,68 @@ async function ensureSite(dataDir: string, site: string): Promise<SitePaths> {
   return created;
 }
 
-async function readOrigins(file: string): Promise<string[]> {
-  const parsed = await readPrivateJson(file);
-  if (parsed === undefined) return [];
-  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { origins?: unknown }).origins)) {
-    throw new Error("Origins file has an unexpected shape. Refusing to read it.");
+function pushOrigin(origins: string[], entry: unknown): void {
+  if (typeof entry !== "string") return;
+  try {
+    const origin = assertOrigin(entry);
+    if (!origins.includes(origin)) origins.push(origin);
+  } catch {
+    // Drop paths, credentials, and other values that are not origins.
   }
-  const origins: string[] = [];
-  for (const entry of (parsed as { origins: unknown[] }).origins) {
-    if (typeof entry !== "string") continue;
-    try {
-      const origin = assertOrigin(entry);
-      if (!origins.includes(origin)) origins.push(origin);
-    } catch {
-      continue;
-    }
-  }
-  origins.sort();
-  return origins;
 }
 
-async function readLastUsed(file: string): Promise<string | null> {
+export function parseOriginRecord(parsed: unknown): OriginRecord {
+  if (parsed === undefined) return { loginOrigin: null, workOrigins: [], origins: [] };
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Origins file has an unexpected shape. Refusing to read it.");
+  }
+  const body = parsed as { origins?: unknown; loginOrigin?: unknown; workOrigins?: unknown };
+  const hasShape =
+    Array.isArray(body.origins) ||
+    typeof body.loginOrigin === "string" ||
+    body.loginOrigin === null ||
+    Array.isArray(body.workOrigins);
+  if (!hasShape) throw new Error("Origins file has an unexpected shape. Refusing to read it.");
+  const bag: string[] = [];
+  if (Array.isArray(body.origins)) {
+    for (const entry of body.origins) pushOrigin(bag, entry);
+  }
+  let loginOrigin: string | null = null;
+  if (typeof body.loginOrigin === "string") {
+    try {
+      loginOrigin = assertOrigin(body.loginOrigin);
+      if (!bag.includes(loginOrigin)) bag.push(loginOrigin);
+    } catch {
+      loginOrigin = null;
+    }
+  }
+  if (Array.isArray(body.workOrigins)) {
+    for (const entry of body.workOrigins) pushOrigin(bag, entry);
+  }
+  const workOrigins = bag.filter((origin) => origin !== loginOrigin).sort();
+  const origins = [...(loginOrigin ? [loginOrigin] : []), ...workOrigins];
+  const unique = [...new Set(origins)].sort();
+  return { loginOrigin, workOrigins, origins: unique };
+}
+
+async function readOriginRecord(file: string): Promise<OriginRecord> {
   const parsed = await readPrivateJson(file);
-  if (!parsed || typeof parsed !== "object") return null;
+  if (parsed === undefined) return { loginOrigin: null, workOrigins: [], origins: [] };
+  return parseOriginRecord(parsed);
+}
+
+const LAST_USED = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
+export function parseSessionState(value: unknown): SessionState {
+  return value === "needs_login" ? "needs_login" : "ok";
+}
+
+async function readMeta(file: string): Promise<{ lastUsed: string | null; session: SessionState }> {
+  const parsed = await readPrivateJson(file);
+  if (!parsed || typeof parsed !== "object") return { lastUsed: null, session: "ok" };
   const value = (parsed as { lastUsed?: unknown }).lastUsed;
-  if (typeof value !== "string" || value.length === 0 || value.length > 40) return null;
-  return value;
+  const lastUsed = typeof value === "string" && LAST_USED.test(value) ? value : null;
+  return { lastUsed, session: parseSessionState((parsed as { session?: unknown }).session) };
 }
 
 export function createFileStore(dataDir: string): OriginStore {
@@ -74,22 +119,32 @@ export function createFileStore(dataDir: string): OriginStore {
       const records: SiteRecord[] = [];
       for (const id of listSiteIds(dataDir)) {
         const paths = resolveSitePaths(dataDir, id);
+        const record = await readOriginRecord(paths.origins);
+        const meta = await readMeta(paths.meta);
         records.push({
           site: id,
-          origins: await readOrigins(paths.origins),
-          lastUsed: await readLastUsed(paths.meta),
+          loginOrigin: record.loginOrigin,
+          workOrigins: record.workOrigins,
+          origins: record.origins,
+          lastUsed: meta.lastUsed,
+          session: meta.session,
         });
       }
       return records;
     },
     async has(site: string, origin: string) {
       const paths = resolveSitePaths(dataDir, site);
-      const origins = await readOrigins(paths.origins);
-      return origins.includes(origin);
+      const record = await readOriginRecord(paths.origins);
+      return record.origins.includes(origin);
     },
     async confirm(site: string, origins: string[]) {
-      const valid = [...new Set(origins.map((origin) => assertOrigin(origin)))].sort();
-      if (valid.length === 0) throw new Error("No origin to confirm.");
+      const incoming: string[] = [];
+      for (const origin of origins) {
+        const valid = assertOrigin(origin);
+        if (!incoming.includes(valid)) incoming.push(valid);
+      }
+      if (incoming.length === 0) throw new Error("No origin to confirm.");
+      const loginUpdate = incoming[0]!;
       const paths = await ensureSite(dataDir, site);
       return siteLock(paths.root)(async () => {
         try {
@@ -98,21 +153,24 @@ export function createFileStore(dataDir: string): OriginStore {
         } catch (error) {
           if (!isNotFound(error)) throw error;
         }
-        const existing = await readOrigins(paths.origins);
-        for (const origin of valid) {
-          if (!existing.includes(origin)) existing.push(origin);
-        }
-        if (existing.length > MAX_ORIGINS) throw new Error("Too many confirmed origins.");
-        existing.sort();
-        await writePrivateJson(paths.origins, { origins: existing });
-        return existing;
+        const existing = await readOriginRecord(paths.origins);
+        const allowed = new Set(existing.origins);
+        for (const origin of incoming) allowed.add(origin);
+        if (allowed.size > MAX_ORIGINS) throw new Error("Too many confirmed origins.");
+        const loginOrigin = loginUpdate;
+        const workOrigins = [...allowed].filter((origin) => origin !== loginOrigin).sort();
+        const all = [...allowed].sort();
+        await writePrivateJson(paths.origins, { loginOrigin, workOrigins, origins: all });
+        return all;
       });
     },
-    async touch(site: string, when: Date = new Date()) {
+    async touch(site: string, when: Date = new Date(), session?: SessionState) {
       const paths = await ensureSite(dataDir, site);
       const lastUsed = when.toISOString();
       await siteLock(paths.root)(async () => {
-        await writePrivateJson(paths.meta, { lastUsed });
+        const prev = await readMeta(paths.meta);
+        const next = session === "needs_login" || session === "ok" ? session : prev.session;
+        await writePrivateJson(paths.meta, { lastUsed, session: next });
       });
       return lastUsed;
     },

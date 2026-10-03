@@ -4,6 +4,7 @@ import {
   PolicyError,
   assertOrigin,
   assertPinnedHost,
+  hostResolverRules,
   elementIsChallenge,
   elementIsPassword,
   looksLikeChallengeWidget,
@@ -234,5 +235,39 @@ test("pins DNS names and rejects rebinding onto link-local, metadata, or unspeci
         throw new Error("ENOTFOUND missing.example");
       }),
     /could not be resolved/,
+  );
+});
+
+test("host resolver rules reject metadata addresses and pin one checked address", () => {
+  assert.throws(
+    () => hostResolverRules([{ hostname: "evil.example", addresses: ["169.254.169.254"] }]),
+    PolicyError,
+  );
+  assert.throws(
+    () => hostResolverRules([{ hostname: "evil.example", addresses: ["93.184.216.34", "169.254.169.254"] }]),
+    /link-local|metadata|unspecified/,
+  );
+  for (const bad of ["0.0.0.0", "::", "fe80::1", "100.100.100.200", "::ffff:169.254.169.254"]) {
+    assert.throws(
+      () => hostResolverRules([{ hostname: "evil.example", addresses: [bad] }]),
+      PolicyError,
+      bad,
+    );
+  }
+  assert.equal(
+    hostResolverRules([{ hostname: "Example.COM", addresses: ["203.0.113.9", "93.184.216.34"] }]),
+    "MAP example.com 93.184.216.34",
+  );
+  assert.equal(
+    hostResolverRules([{ hostname: "v6.example", addresses: ["2001:db8::2"] }]),
+    "MAP v6.example [2001:db8::2]",
+  );
+  assert.equal(hostResolverRules([{ hostname: "10.0.0.5", addresses: ["10.0.0.5"] }]), "");
+  assert.equal(
+    hostResolverRules([
+      { hostname: "b.example", addresses: ["203.0.113.8"] },
+      { hostname: "a.example", addresses: ["203.0.113.7", "2001:db8::1"] },
+    ]),
+    "MAP a.example 203.0.113.7, MAP b.example 203.0.113.8",
   );
 });

@@ -7,12 +7,28 @@ import { createService, type Status } from "../src/service.ts";
 
 const SITE = "demo";
 
-function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[] } {
+function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[]; session: "ok" | "needs_login" } {
   const confirmed = [...initial];
+  let session: "ok" | "needs_login" = "ok";
+  let lastUsed: string | null = null;
   return {
     confirmed,
+    get session() {
+      return session;
+    },
     async list() {
-      return [{ site: SITE, origins: [...confirmed].sort(), lastUsed: null }];
+      const origins = [...confirmed].sort();
+      const loginOrigin = origins[0] ?? null;
+      return [
+        {
+          site: SITE,
+          origins,
+          loginOrigin,
+          workOrigins: origins.filter((origin) => origin !== loginOrigin),
+          lastUsed,
+          session,
+        },
+      ];
     },
     async has(site: string, origin: string) {
       return site === SITE && confirmed.includes(origin);
@@ -24,8 +40,10 @@ function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[
       }
       return [...confirmed].sort();
     },
-    async touch() {
-      return new Date().toISOString();
+    async touch(_site: string, _when?: Date, next?: "ok" | "needs_login") {
+      lastUsed = new Date().toISOString();
+      if (next === "ok" || next === "needs_login") session = next;
+      return lastUsed;
     },
   };
 }
@@ -112,17 +130,22 @@ test("status shape has no cookie fields", async () => {
   const result = await service.status();
   assert.equal(result.isError, undefined);
   const status = JSON.parse(result.text) as Status;
-  assert.deepEqual(Object.keys(status).sort(), ["browserOpen", "openSite", "sites"]);
+  assert.deepEqual(Object.keys(status).sort(), ["browserOpen", "lines", "openSite", "sites"]);
   assert.equal(typeof status.browserOpen, "boolean");
   assert.equal(status.openSite, null);
   assert.equal(status.sites.length, 1);
+  assert.equal(status.lines.length, 1);
   const site = status.sites[0]!;
-  assert.deepEqual(Object.keys(site).sort(), ["lastUsed", "origins", "profileExists", "site"]);
+  assert.deepEqual(Object.keys(site).sort(), ["lastUsed", "line", "origins", "profileExists", "session", "site"]);
   assert.equal(site.site, SITE);
   assert.deepEqual(site.origins, ["https://example.com"]);
+  assert.equal(site.session, "ok");
+  assert.equal(site.line, "demo origins=https://example.com lastUsed=- session=ok");
+  assert.equal(status.lines[0], site.line);
   assert.equal(typeof site.profileExists, "boolean");
   walkNoSecrets(status);
   assert.equal(result.text.toLowerCase().includes("cookie"), false);
+  assert.equal(result.text.includes("?"), false);
 });
 
 test("login does not confirm the origin or accept credential URLs", async () => {
@@ -405,6 +428,148 @@ test("same-origin open redacts credential query values", async () => {
   assert.equal(body.url.includes("secret-token"), false);
   assert.equal(body.url.includes("access_token"), false);
   assert.match(body.url, /tab=1/);
+});
+
+
+test("origin pair allows the login and work origins and blanks any other origin", async () => {
+  const store = memoryStore(["https://auth.example", "https://www.example"]);
+  const browser = fakeBrowser({
+    async open(url: string) {
+      browser.calls.push(`open ${url}`);
+      if (url.endsWith("/hop")) {
+        return {
+          title: "SECRET-TITLE",
+          url: "https://bank.example/account?token=secret-token",
+          hasPasswordInput: false,
+          textSample: "balance",
+        };
+      }
+      return {
+        title: "Work",
+        url,
+        hasPasswordInput: false,
+        textSample: "inbox",
+      };
+    },
+  });
+  const service = serviceWith(store, browser);
+  const work = await service.open(SITE, "https://www.example/inbox");
+  assert.equal(work.isError, undefined);
+  const login = await service.open(SITE, "https://auth.example/session");
+  assert.equal(login.isError, undefined);
+  const hopped = await service.open(SITE, "https://www.example/hop");
+  assert.equal(hopped.isError, true);
+  assert.match(hopped.text, /origin_not_confirmed/);
+  assert.match(hopped.text, /human_action_required/);
+  assert.equal(hopped.text.includes("secret-token"), false);
+  assert.equal(hopped.text.includes("SECRET-TITLE"), false);
+  assert.equal(hopped.text.includes("account"), false);
+  assert.ok(browser.calls.includes("blank"));
+});
+
+test("status session is needs_login after a login page and the line has no query secrets", async () => {
+  const store = memoryStore(["https://example.com"]);
+  let loginPage = true;
+  const browser = fakeBrowser({
+    async open(url: string) {
+      browser.calls.push(`open ${url}`);
+      if (loginPage) {
+        return {
+          title: "Sign in",
+          url: "https://example.com/login?token=secret-token&next=/home",
+          hasPasswordInput: true,
+          textSample: "Enter your password",
+        };
+      }
+      return {
+        title: "Dashboard",
+        url: "https://example.com/dashboard",
+        hasPasswordInput: false,
+        textSample: "Hello",
+      };
+    },
+  });
+  const service = serviceWith(store, browser);
+  const expired = await service.open(SITE, "https://example.com/login");
+  const expiredBody = JSON.parse(expired.text) as { human_action_required?: boolean };
+  assert.equal(expiredBody.human_action_required, true);
+  assert.equal(expired.text.includes("secret-token"), false);
+  const needs = JSON.parse((await service.status()).text) as Status;
+  assert.equal(needs.sites[0]?.session, "needs_login");
+  assert.match(needs.lines[0] ?? "", /^demo origins=https:\/\/example.com lastUsed=.+ session=needs_login$/);
+  assert.equal((needs.lines[0] ?? "").includes("secret-token"), false);
+  assert.equal((needs.lines[0] ?? "").includes("?"), false);
+  assert.equal((needs.lines[0] ?? "").toLowerCase().includes("cookie"), false);
+  loginPage = false;
+  const again = await service.open(SITE, "https://example.com/dashboard");
+  assert.equal(again.isError, undefined);
+  const okStatus = JSON.parse((await service.status()).text) as Status;
+  assert.equal(okStatus.sites[0]?.session, "ok");
+  assert.match(okStatus.lines[0] ?? "", /session=ok$/);
+});
+
+test("open, read, and act re-resolve DNS pins and reject metadata answers", async () => {
+  const store = memoryStore(["https://example.com"]);
+  const browser = fakeBrowser();
+  const launches: Array<{ pins?: { hostname: string; addresses: readonly string[] }[]; relaunch?: boolean }> = [];
+  let lookups = 0;
+  let answers = ["93.184.216.34"];
+  const recording = {
+    ...browser,
+    exclusive(
+      site: string,
+      fn: Parameters<BrowserControl["exclusive"]>[1],
+      options?: Parameters<BrowserControl["exclusive"]>[2],
+    ) {
+      launches.push(options ?? {});
+      return browser.exclusive(site, fn);
+    },
+  };
+  const service = createService({
+    store,
+    browser: recording,
+    human: allowHuman(),
+    log: () => undefined,
+    resolveHost: async (hostname: string) => {
+      lookups += 1;
+      if (hostname === "rebind.example") return ["169.254.169.254"];
+      return answers;
+    },
+  });
+  const beforeOpen = lookups;
+  const opened = await service.open(SITE, "https://example.com/dashboard");
+  assert.equal(opened.isError, undefined);
+  assert.ok(lookups > beforeOpen);
+  const openLaunch = launches.at(-1);
+  assert.equal(openLaunch?.relaunch, true);
+  assert.ok(openLaunch?.pins?.some((pin) => pin.hostname === "example.com" && pin.addresses.includes("93.184.216.34")));
+
+  const beforeRead = lookups;
+  const read = await service.read(SITE, { url: "https://example.com/dashboard" });
+  assert.equal(read.isError, undefined);
+  assert.ok(lookups > beforeRead);
+  assert.equal(launches.at(-1)?.relaunch, true);
+
+  const beforeAct = lookups;
+  const acted = await service.act(SITE, { action: "click", selector: "button.go" });
+  assert.equal(acted.isError, undefined);
+  assert.ok(lookups > beforeAct);
+  assert.equal(launches.at(-1)?.relaunch, false);
+
+  answers = ["169.254.169.254", "93.184.216.34"];
+  const callsBefore = browser.calls.length;
+  const rejected = await service.open(SITE, "https://example.com/secret-path");
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.text, /link-local|metadata|unspecified/);
+  assert.equal(rejected.text.includes("secret-path"), false);
+  assert.equal(browser.calls.length, callsBefore);
+
+  const foreign = await service.open(SITE, "https://rebind.example/latest/meta-data/secret");
+  assert.equal(foreign.isError, true);
+  assert.match(foreign.text, /link-local|metadata|unspecified/);
+  assert.equal(foreign.text.includes("secret"), false);
+  assert.equal(foreign.text.includes("meta-data"), false);
+  assert.equal(browser.calls.length, callsBefore);
 });
 
 function walkNoSecrets(value: unknown): void {

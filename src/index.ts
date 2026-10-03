@@ -54,7 +54,7 @@ async function main(): Promise<void> {
   }
   if (!config.encryptionKey) {
     console.error(
-      "[login-mcp] LOGIN_MCP_KEY is unset. Profiles are chmod 0700 only. Set LOGIN_MCP_KEY for scrypt + AES-256-GCM at rest.",
+      "[login-mcp] LOGIN_MCP_KEY is unset. Profiles stay mode 0700/0600. Set LOGIN_MCP_KEY to encrypt a profile when its browser closes. SIGKILL cannot run that hook.",
     );
   }
   const browser = createChromeBrowser({
@@ -79,7 +79,7 @@ async function main(): Promise<void> {
     "auth_status",
     {
       description:
-        "List site ids, human-confirmed origins, and roughly when each profile was last used. Returns no cookies or tokens.",
+        "One line per site: site id, confirmed login and work origins, last used time, and session ok or needs_login. needs_login means the last open saw a login page. Returns no cookies, tokens, or URL query secrets.",
       inputSchema: {
         site: siteField.optional().describe("Optional site id. Omit to list every site."),
       },
@@ -122,7 +122,7 @@ async function main(): Promise<void> {
     "auth_open",
     {
       description:
-        "Open a URL in that site's Chrome profile. The origin must already be human-confirmed for the site. Returns human_action_required and no page text when the page looks like a login or challenge.",
+        "Open a URL in that site's Chrome profile. The origin must already be human-confirmed for the site (login origin or a work origin). Re-resolves DNS and pins Chrome to the checked addresses. Returns human_action_required and no page text when the page looks like a login or challenge, or when navigation leaves the confirmed origins.",
       inputSchema: {
         site: siteField,
         url: z.string().describe("Absolute http(s) URL on a confirmed origin for this site."),
@@ -135,7 +135,7 @@ async function main(): Promise<void> {
     "auth_read",
     {
       description:
-        "Read visible text from this site's current page, or navigate first when url is set and its origin is human-confirmed for the site. Refuses unconfirmed origins. Truncates long text. Never returns cookies or storage.",
+        "Read visible text from this site's current page, or navigate first when url is set and its origin is human-confirmed for the site. Re-resolves DNS on every call. Refuses unconfirmed origins. Truncates long text. Never returns cookies or storage.",
       inputSchema: {
         site: siteField,
         url: z.string().optional().describe("Optional absolute http(s) URL on a confirmed origin for this site."),
@@ -150,7 +150,7 @@ async function main(): Promise<void> {
     "auth_act",
     {
       description:
-        "Perform one click, fill, or press on this site's current page. Refuses unconfirmed origins, password fields, and challenge widgets. fill and press require value. Does not solve CAPTCHA or 2FA.",
+        "Perform one click, fill, or press on this site's current page. Re-resolves DNS on every call. Refuses unconfirmed origins, password fields, and challenge widgets. fill and press require value. Does not solve CAPTCHA or 2FA.",
       inputSchema: {
         site: siteField,
         action: z.enum(["click", "fill", "press"]).describe("The single action to perform."),

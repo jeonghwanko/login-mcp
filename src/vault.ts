@@ -89,6 +89,23 @@ export function createProfileVault(encryptionKey: string | null): {
   return { unlockSite, lockSite, lockAll };
 }
 
+export type ProfileLockReason = "browser_closed" | "process_exit" | "relaunch";
+
+/**
+ * Lock a site profile when its browser goes away.
+ * relaunch leaves the plaintext directory in place so the same site can start again.
+ * SIGKILL never invokes this: the process is gone before the close hook can run.
+ */
+export function relockClosedSite(
+  vault: { lockSite(dataDir: string, site: string): void },
+  dataDir: string,
+  site: string,
+  reason: ProfileLockReason,
+): void {
+  if (reason === "relaunch") return;
+  vault.lockSite(dataDir, site);
+}
+
 function isRegularFile(file: string): boolean {
   try {
     const st = fs.lstatSync(file);

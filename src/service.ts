@@ -1,17 +1,21 @@
-import { BrowserPolicyError, type BrowserControl, type PageSignals } from "./browser.js";
+import { isIP } from "node:net";
+import { BrowserPolicyError, DnsPinError, type BrowserControl, type PageSignals } from "./browser.js";
 import { HumanSignalError, type HumanSignals } from "./human-signal.js";
-import type { OriginStore, SiteRecord } from "./origins.js";
+import type { OriginStore, SessionState, SiteRecord } from "./origins.js";
 import {
   PolicyError,
   assertOrigin,
   assertPinnedHost,
   defaultResolveHost,
+  hostLabel,
   looksLikeChallengeWidget,
   looksLikeLoginOrChallenge,
   looksLikePasswordField,
   parseHttpUrl,
   redactUrl,
+  resolvePinnedHost,
   scrubPublicText,
+  type HostPin,
   type HostResolver,
 } from "./policy.js";
 import { assertSiteId, resolveSitePaths, SitePathError } from "./site-path.js";
@@ -25,12 +29,16 @@ export interface SiteStatus {
   site: string;
   origins: string[];
   lastUsed: string | null;
+  session: SessionState;
   profileExists: boolean;
+  /** One line: site id, confirmed origins, last used time, session. No secrets. */
+  line: string;
 }
 
 export interface Status {
   browserOpen: boolean;
   openSite: string | null;
+  lines: string[];
   sites: SiteStatus[];
 }
 
@@ -98,6 +106,9 @@ export function createService(deps: {
         message: error.message,
       });
     }
+    if (error instanceof DnsPinError) {
+      return fail({ ok: false, reason: error.reason, message: error.message });
+    }
     if (error instanceof SitePathError || error instanceof HumanSignalError || error instanceof PolicyError) {
       return policyFailure(error, secret);
     }
@@ -117,30 +128,60 @@ export function createService(deps: {
     }
   }
 
-  async function screen(input: string): Promise<URL | ToolText> {
+  async function pinsFor(site: string, extraHost?: string): Promise<HostPin[] | ToolText> {
+    const hosts = new Set<string>();
+    if (extraHost) {
+      const host = hostLabel(extraHost);
+      if (isIP(host) === 0) hosts.add(host);
+    }
     try {
-      const url = parseHttpUrl(input);
-      await assertPinnedHost(url.hostname, resolve);
-      return url;
+      const listed = await deps.store.list();
+      const record = listed.find((item) => item.site === site);
+      for (const origin of record?.origins ?? []) {
+        try {
+          const host = hostLabel(new URL(origin).hostname);
+          if (isIP(host) === 0) hosts.add(host);
+        } catch {
+          continue;
+        }
+      }
+    } catch (error) {
+      return browserFailure(error);
+    }
+    const pins: HostPin[] = [];
+    for (const host of [...hosts].sort()) {
+      try {
+        const addresses = await resolvePinnedHost(host, resolve);
+        pins.push({ hostname: host, addresses });
+      } catch (error) {
+        return policyFailure(error);
+      }
+    }
+    return pins;
+  }
+
+  async function guardPinnedUrl(url: string): Promise<URL | ToolText> {
+    try {
+      const parsed = parseHttpUrl(url);
+      await assertPinnedHost(parsed.hostname, resolve);
+      return parsed;
     } catch (error) {
       return policyFailure(error);
     }
   }
 
-  async function requireConfirmed(site: string, url: string): Promise<ToolText | string> {
-    const parsed = await screen(url);
-    if (!(parsed instanceof URL)) return parsed;
-    if (!(await deps.store.has(site, parsed.origin))) return originNotConfirmed(parsed.origin);
-    return parsed.origin;
-  }
-
   function toStatus(record: SiteRecord): SiteStatus {
-    return {
+    const session: SessionState = record.session === "needs_login" ? "needs_login" : "ok";
+    const site: SiteStatus = {
       site: record.site,
       origins: record.origins,
       lastUsed: record.lastUsed,
+      session,
       profileExists: deps.browser.profileExists(record.site),
+      line: "",
     };
+    site.line = formatSiteLine(site);
+    return site;
   }
 
   return {
@@ -156,11 +197,21 @@ export function createService(deps: {
         const listed = await deps.store.list();
         const sites = listed.filter((record) => (filter ? record.site === filter : true)).map(toStatus);
         if (filter && sites.length === 0 && deps.browser.profileExists(filter)) {
-          sites.push({ site: filter, origins: [], lastUsed: null, profileExists: true });
+          const alone: SiteStatus = {
+            site: filter,
+            origins: [],
+            lastUsed: null,
+            session: "ok",
+            profileExists: true,
+            line: "",
+          };
+          alone.line = formatSiteLine(alone);
+          sites.push(alone);
         }
         const status: Status = {
           browserOpen: deps.browser.isOpen(),
           openSite: deps.browser.openSite(),
+          lines: sites.map((item) => item.line),
           sites,
         };
         return ok(status);
@@ -172,8 +223,10 @@ export function createService(deps: {
     async login(site: string, url: string) {
       const id = guardSite(site);
       if (typeof id !== "string") return id;
-      const parsed = await screen(url);
+      const parsed = await guardPinnedUrl(url);
       if (!(parsed instanceof URL)) return parsed;
+      const pins = await pinsFor(id, parsed.hostname);
+      if (!Array.isArray(pins)) return pins;
       let confirmUrl: string | null = null;
       try {
         confirmUrl = await deps.human.beginLogin(id, parsed.origin);
@@ -182,9 +235,13 @@ export function createService(deps: {
       }
       log(`[login-mcp] auth_login site=${id} url=${safeUrl(parsed.href)}`);
       try {
-        await deps.browser.exclusive(id, async (ops) => {
-          await ops.login(parsed.href, confirmUrl ?? undefined);
-        });
+        await deps.browser.exclusive(
+          id,
+          async (ops) => {
+            await ops.login(parsed.href, confirmUrl ?? undefined);
+          },
+          { pins, relaunch: true },
+        );
         await deps.store.touch(id);
       } catch (error) {
         return browserFailure(error, confirmUrl ?? undefined);
@@ -232,7 +289,8 @@ export function createService(deps: {
         });
       }
       try {
-        const origins = await deps.store.confirm(id, approved);
+        const ordered = [primary, ...approved.filter((origin) => origin !== primary)];
+        const origins = await deps.store.confirm(id, ordered);
         await deps.store.touch(id);
         return ok({ site: id, origin: primary, workOrigin: requested[1] ?? null, origins });
       } catch (error) {
@@ -243,14 +301,17 @@ export function createService(deps: {
     async open(site: string, url: string) {
       const id = guardSite(site);
       if (typeof id !== "string") return id;
-      const confirmed = await requireConfirmed(id, url);
-      if (typeof confirmed !== "string") return confirmed;
-      log(`[login-mcp] auth_open site=${id} url=${safeUrl(url)}`);
+      const parsed = await guardPinnedUrl(url);
+      if (!(parsed instanceof URL)) return parsed;
+      const pins = await pinsFor(id, parsed.hostname);
+      if (!Array.isArray(pins)) return pins;
+      if (!(await deps.store.has(id, parsed.origin))) return originNotConfirmed(parsed.origin);
+      log(`[login-mcp] auth_open site=${id} url=${safeUrl(parsed.href)}`);
       try {
         return await deps.browser.exclusive(id, async (ops) => {
           let page: PageSignals;
           try {
-            page = await ops.open(url);
+            page = await ops.open(parsed.href);
           } catch (error) {
             return browserFailure(error);
           }
@@ -260,14 +321,14 @@ export function createService(deps: {
             return gate;
           }
           const humanActionRequired = looksLikeLoginOrChallenge(page);
-          await deps.store.touch(id);
+          await deps.store.touch(id, new Date(), humanActionRequired ? "needs_login" : "ok");
           return ok({
             title: humanActionRequired ? undefined : oneLine(page.title, 300),
             url: redactUrl(page.url),
             human_action_required: humanActionRequired,
             message: humanActionRequired ? SESSION_EXPIRED : undefined,
           });
-        });
+        }, { pins, relaunch: true });
       } catch (error) {
         return browserFailure(error);
       }
@@ -295,9 +356,20 @@ export function createService(deps: {
           message: "Refusing to read a CAPTCHA or challenge widget.",
         });
       }
+      let pins: HostPin[] = [];
+      let relaunch = false;
       if (input.url) {
-        const confirmed = await requireConfirmed(id, input.url);
-        if (typeof confirmed !== "string") return confirmed;
+        const parsed = await guardPinnedUrl(input.url);
+        if (!(parsed instanceof URL)) return parsed;
+        const resolved = await pinsFor(id, parsed.hostname);
+        if (!Array.isArray(resolved)) return resolved;
+        if (!(await deps.store.has(id, parsed.origin))) return originNotConfirmed(parsed.origin);
+        pins = resolved;
+        relaunch = true;
+      } else {
+        const resolved = await pinsFor(id);
+        if (!Array.isArray(resolved)) return resolved;
+        pins = resolved;
       }
       log(`[login-mcp] auth_read site=${id} url=${input.url ? safeUrl(input.url) : ""} selector=${oneLine(input.selector ?? "", 200)}`);
       try {
@@ -329,6 +401,7 @@ export function createService(deps: {
             return gate;
           }
           if (looksLikeLoginOrChallenge(page)) {
+            await deps.store.touch(id, new Date(), "needs_login");
             return challengeResult(page.url);
           }
           let read: { text: string; truncated: boolean };
@@ -351,9 +424,10 @@ export function createService(deps: {
             return afterGate;
           }
           if (looksLikeLoginOrChallenge(after)) {
+            await deps.store.touch(id, new Date(), "needs_login");
             return challengeResult(after.url);
           }
-          await deps.store.touch(id);
+          await deps.store.touch(id, new Date(), "ok");
           return ok({
             url: redactUrl(after.url),
             selector: input.selector ?? null,
@@ -361,7 +435,7 @@ export function createService(deps: {
             truncated: read.truncated,
             human_action_required: false,
           });
-        });
+        }, { pins, relaunch });
       } catch (error) {
         return browserFailure(error);
       }
@@ -406,6 +480,15 @@ export function createService(deps: {
           message: "Refusing to interact with a CAPTCHA or challenge widget. Finish it in the Chrome window.",
         });
       }
+      const pins = await pinsFor(id);
+      if (!Array.isArray(pins)) {
+        if (deps.browser.isOpen() && deps.browser.openSite() === id) {
+          await deps.browser.exclusive(id, async (ops) => {
+            await ops.blank();
+          }).catch(() => undefined);
+        }
+        return pins;
+      }
       log(`[login-mcp] auth_act site=${id} action=${input.action} selector=${oneLine(input.selector, 200)}`);
       try {
         return await deps.browser.exclusive(id, async (ops) => {
@@ -428,6 +511,7 @@ export function createService(deps: {
             return gate;
           }
           if (looksLikeLoginOrChallenge(page)) {
+            await deps.store.touch(id, new Date(), "needs_login");
             return fail({
               ok: false,
               reason: "challenge_refused",
@@ -448,6 +532,7 @@ export function createService(deps: {
               return left;
             }
             if (looksLikeLoginOrChallenge(after)) {
+              await deps.store.touch(id, new Date(), "needs_login");
               return fail({
                 ok: false,
                 reason: "challenge_refused",
@@ -456,9 +541,9 @@ export function createService(deps: {
               });
             }
           }
-          await deps.store.touch(id);
+          await deps.store.touch(id, new Date(), "ok");
           return ok({ ok: true, action: input.action, selector: input.selector });
-        });
+        }, { pins, relaunch: false });
       } catch (error) {
         return browserFailure(error, input.value);
       }
@@ -544,6 +629,18 @@ function challengeResult(pageUrl: string): ToolText {
 
 function validSelector(selector: string): boolean {
   return selector.length > 0 && selector.length <= SELECTOR_LIMIT;
+}
+
+export function formatSiteLine(input: {
+  site: string;
+  origins: readonly string[];
+  lastUsed: string | null;
+  session: SessionState;
+}): string {
+  const origins = input.origins.length > 0 ? input.origins.join(",") : "-";
+  const lastUsed = input.lastUsed ?? "-";
+  const session = input.session === "needs_login" ? "needs_login" : "ok";
+  return `${input.site} origins=${origins} lastUsed=${lastUsed} session=${session}`;
 }
 
 function oneLine(value: string, limit: number): string {

@@ -318,16 +318,24 @@ export function assertResolvedAddress(address: string): void {
   parseHttpUrl(literal);
 }
 
+export interface HostPin {
+  hostname: string;
+  addresses: readonly string[];
+}
+
 /**
  * IP literals are checked directly. DNS names must resolve, and every answer
  * must be a pinned-safe address. One link-local, metadata, or unspecified
- * answer rejects the host (DNS rebinding).
+ * answer rejects the host (DNS rebinding). Returns the checked addresses.
  */
-export async function assertPinnedHost(hostname: string, resolve: HostResolver): Promise<void> {
+export async function resolvePinnedHost(
+  hostname: string,
+  resolve: HostResolver,
+): Promise<readonly string[]> {
   const host = hostLabel(hostname);
   if (isIP(host) !== 0) {
     assertResolvedAddress(host);
-    return;
+    return [host];
   }
   if (!isPinnableDnsName(host)) {
     throw new PolicyError("Refusing a host that is not a pinnable DNS name.");
@@ -341,6 +349,7 @@ export async function assertPinnedHost(hostname: string, resolve: HostResolver):
   if (answers.length === 0) {
     throw new PolicyError("Refusing a host that could not be resolved and pinned.");
   }
+  const checked: string[] = [];
   for (const answer of answers) {
     try {
       assertResolvedAddress(answer);
@@ -349,7 +358,72 @@ export async function assertPinnedHost(hostname: string, resolve: HostResolver):
         "Refusing a host that resolves to a link-local, metadata, or unspecified address.",
       );
     }
+    checked.push(answer.trim().toLowerCase());
   }
+  return checked;
+}
+
+export async function assertPinnedHost(hostname: string, resolve: HostResolver): Promise<void> {
+  await resolvePinnedHost(hostname, resolve);
+}
+
+/**
+ * Chromium --host-resolver-rules value. MAP accepts one replacement, so each
+ * DNS name is pinned to one checked address (lowest IPv4, else lowest IPv6).
+ * Every address is rejected first if it is link-local, metadata, or unspecified.
+ * IPv6 replacements are bracketed so the last colon is not parsed as a port.
+ */
+export function hostResolverRules(pins: readonly HostPin[]): string {
+  const rules: string[] = [];
+  const items = pins
+    .map((pin) => ({ hostname: hostLabel(pin.hostname), addresses: pin.addresses }))
+    .sort((a, b) => a.hostname.localeCompare(b.hostname));
+  for (const pin of items) {
+    if (isIP(pin.hostname) !== 0) {
+      assertResolvedAddress(pin.hostname);
+      continue;
+    }
+    if (!isPinnableDnsName(pin.hostname)) {
+      throw new PolicyError("Refusing a host that is not a pinnable DNS name.");
+    }
+    if (pin.addresses.length === 0) {
+      throw new PolicyError("Refusing a host that could not be resolved and pinned.");
+    }
+    const checked: string[] = [];
+    for (const address of pin.addresses) {
+      assertResolvedAddress(address);
+      checked.push(address.trim().toLowerCase());
+    }
+    const chosen = choosePinAddress(checked);
+    rules.push(`MAP ${pin.hostname} ${formatResolverAddress(chosen)}`);
+  }
+  return rules.join(", ");
+}
+
+function choosePinAddress(addresses: readonly string[]): string {
+  const unique = [...new Set(addresses)];
+  const v4 = unique.filter((address) => isIP(address) === 4).sort(compareIPv4);
+  if (v4.length > 0) return v4[0]!;
+  const v6 = unique.filter((address) => isIP(address) === 6).sort();
+  if (v6.length === 0) {
+    throw new PolicyError("Refusing a host that could not be resolved and pinned.");
+  }
+  return v6[0]!;
+}
+
+function compareIPv4(a: string, b: string): number {
+  const left = a.split(".").map((part) => Number(part));
+  const right = b.split(".").map((part) => Number(part));
+  for (let i = 0; i < 4; i += 1) {
+    const diff = (left[i] ?? 0) - (right[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function formatResolverAddress(address: string): string {
+  if (address.includes(":")) return `[${address.replace(/^\[|\]$/g, "")}]`;
+  return address;
 }
 
 export async function defaultResolveHost(hostname: string): Promise<string[]> {

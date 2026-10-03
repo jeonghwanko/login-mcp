@@ -48,8 +48,15 @@ test("confirm writes origins only and ignores junk already in the file", async (
   assert.equal(written.includes("cookie"), false);
   assert.equal(written.includes("nope"), false);
   assert.equal(written.includes("secret"), false);
-  const parsed = JSON.parse(written) as { origins: string[] };
-  assert.deepEqual(Object.keys(parsed), ["origins"]);
+  const parsed = JSON.parse(written) as {
+    origins: string[];
+    loginOrigin: string | null;
+    workOrigins: string[];
+  };
+  assert.deepEqual(Object.keys(parsed).sort(), ["loginOrigin", "origins", "workOrigins"]);
+  assert.equal(parsed.loginOrigin, "https://new.example");
+  assert.deepEqual(parsed.workOrigins, ["https://already.example"]);
+  assert.deepEqual(parsed.origins, ["https://already.example", "https://new.example"]);
 });
 
 test("invalid origin is not written", async () => {
@@ -69,13 +76,16 @@ test("origins file is private and parallel confirms are not lost", async () => {
     store.confirm("demo", ["https://b.example"]),
     store.confirm("demo", ["https://c.example"]),
   ]);
-  assert.deepEqual(await store.list(), [
-    {
-      site: "demo",
-      origins: ["https://a.example", "https://b.example", "https://c.example"],
-      lastUsed: null,
-    },
-  ]);
+  const listed = await store.list();
+  assert.equal(listed.length, 1);
+  const record = listed[0]!;
+  assert.equal(record.site, "demo");
+  assert.deepEqual(record.origins, ["https://a.example", "https://b.example", "https://c.example"]);
+  assert.equal(record.lastUsed, null);
+  assert.equal(record.session, "ok");
+  assert.ok(record.loginOrigin);
+  assert.equal(record.origins.includes(record.loginOrigin), true);
+  assert.deepEqual([record.loginOrigin, ...record.workOrigins].sort(), record.origins);
   const st = await fs.stat(file);
   assert.equal(st.mode & 0o077, 0);
 });
@@ -128,4 +138,21 @@ test("config refuses the system Chrome profile and a profile directory as data",
       ),
     /Chrome profile directory/,
   );
+});
+
+test("meta stores session without cookies or query secrets", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "login-mcp-"));
+  const store = createFileStore(dir);
+  await store.confirm("demo", ["https://auth.example", "https://www.example"]);
+  await store.touch("demo", new Date("2026-10-03T00:00:00.000Z"), "needs_login");
+  const listed = await store.list();
+  assert.equal(listed[0]?.loginOrigin, "https://auth.example");
+  assert.deepEqual(listed[0]?.workOrigins, ["https://www.example"]);
+  assert.equal(listed[0]?.session, "needs_login");
+  assert.equal(listed[0]?.lastUsed, "2026-10-03T00:00:00.000Z");
+  const meta = await fs.readFile(path.join(dir, "sites", "demo", "meta.json"), "utf8");
+  assert.equal(meta.includes("cookie"), false);
+  assert.equal(meta.includes("?"), false);
+  await store.touch("demo", new Date("2026-10-03T01:00:00.000Z"));
+  assert.equal((await store.list())[0]?.session, "needs_login");
 });

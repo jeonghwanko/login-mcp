@@ -9,8 +9,8 @@ import { createFileStore } from "../src/origins.ts";
 import { writePrivateJson } from "../src/private-file.ts";
 import { createService } from "../src/service.ts";
 import { assertSiteId, resolveSitePaths } from "../src/site-path.ts";
-import { createProfileVault } from "../src/vault.ts";
-import type { BrowserControl, BrowserOps, PageSignals } from "../src/browser.ts";
+import { createProfileVault, relockClosedSite } from "../src/vault.ts";
+import { chromeLaunchArgs, type BrowserControl, type BrowserOps, type PageSignals } from "../src/browser.ts";
 
 const SENTINEL = "COOKIEVALUE-do-not-leak-7f3a9c";
 const KEY = "super-secret-login-mcp-key";
@@ -236,3 +236,41 @@ function idleBrowser(): BrowserControl {
     async close() {},
   };
 }
+
+test("relock helper encrypts on browser close, chmod-only without a key, and skips relaunch", () => {
+  const dir = tempDir();
+  const paths = resolveSitePaths(dir, "demo");
+  fs.mkdirSync(path.join(paths.profile, "Default"), { recursive: true });
+  const cookie = path.join(paths.profile, "Default", "Cookies");
+  fs.writeFileSync(cookie, SENTINEL);
+
+  const vault = createProfileVault(KEY);
+  relockClosedSite(vault, dir, "demo", "relaunch");
+  assert.equal(fs.existsSync(cookie), true);
+  assert.equal(fs.readFileSync(cookie, "utf8"), SENTINEL);
+  assert.equal(fs.existsSync(paths.vault), false);
+
+  relockClosedSite(vault, dir, "demo", "browser_closed");
+  assert.equal(fs.existsSync(paths.profile), false);
+  assert.equal(fs.existsSync(paths.vault), true);
+  const blob = fs.readFileSync(paths.vault);
+  assert.equal(blob.includes(Buffer.from(SENTINEL)), false);
+  assert.equal(blob.includes(Buffer.from(KEY)), false);
+
+  assert.doesNotThrow(() => relockClosedSite(vault, dir, "demo", "process_exit"));
+  assert.equal(fs.existsSync(paths.profile), false);
+
+  vault.unlockSite(dir, "demo");
+  assert.equal(fs.readFileSync(path.join(paths.profile, "Default", "Cookies"), "utf8"), SENTINEL);
+
+  const plain = createProfileVault(null);
+  relockClosedSite(plain, dir, "demo", "browser_closed");
+  assert.equal(fs.existsSync(paths.profile), true);
+  assert.equal(fs.statSync(paths.profile).mode & 0o077, 0);
+  assert.equal(fs.statSync(path.join(paths.profile, "Default", "Cookies")).mode & 0o077, 0);
+  assert.equal(fs.readFileSync(path.join(paths.profile, "Default", "Cookies"), "utf8"), SENTINEL);
+
+  const rules = "MAP example.com 93.184.216.34";
+  assert.deepEqual(chromeLaunchArgs(rules).at(-1), `--host-resolver-rules=${rules}`);
+  assert.equal(chromeLaunchArgs("").some((arg) => arg.startsWith("--host-resolver-rules=")), false);
+});
