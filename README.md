@@ -8,27 +8,27 @@ A person logs into a site once in a local Chrome window. Later, an agent calls M
 
 Each tool takes `site` (a short id such as `wishket`). Chrome user-data directories are separate: `data/sites/<site>/profile`. A login on one site is not sent to another. SSO across sites breaks on purpose.
 
-`auth_confirm` is not an agent allowlist. A person must allow the origin within the last 10 minutes:
+`auth_confirm` is not an agent allowlist, and it is not required after the allow button. A person allows the origin within the last 10 minutes:
 
-1. `auth_login` opens the login URL and a local tab. Click **이 사이트 허용**. Optional work origin (for example `https://auth.wishket.com` and `https://www.wishket.com`) is stored as a pair for that site.
-2. Or, in an interactive terminal: `node dist/index.js confirm --site wishket --origin https://auth.wishket.com --work-origin https://www.wishket.com` and type the code shown only in that Chrome tab.
+1. `auth_login` opens the login URL and a local tab. Before the button, that tab lists the login origin and the work origin. Those are a registrable-site pair, or the http(s) origins of the open tabs that are not the local allow server. For Wishket that is `https://auth.wishket.com` and `https://www.wishket.com`. Click **이 사이트 허용**. That records the human signal and confirms those origins for the site immediately. The success page says **허용되었습니다**. Do not call `auth_confirm` after the button.
+2. Or, in an interactive terminal: `node dist/index.js confirm --site wishket --origin https://auth.wishket.com --work-origin https://www.wishket.com` and type the code shown only in that Chrome tab. That command only records the signal. Then call `auth_confirm` within 10 minutes.
 
 The code and the tab URL are not returned by the MCP tool. A forged `human-signal.json` is ignored (HMAC, key kept in process memory). The signal expires after 10 minutes. `auth_read` and `auth_act` still refuse origins that are not confirmed.
 
-If `LOGIN_MCP_KEY` is set, the per-site profile is decrypted only while that site's Chrome is running. It is encrypted again with scrypt and AES-256-GCM as soon as that site's browser closes (switching sites, the window closing, or process shutdown) and the plaintext directory is removed. If the key is unset, there is no ciphertext; the profile stays mode `0700` (files `0600`) at rest, including after the browser closes. The key is never logged. `SIGKILL` cannot run the close hook. On the next start, and again before a site browser is opened, a plaintext leftover is encrypted immediately when the key is set, or chmod'd to `0700`/`0600` when it is not. That pass does not delete the session. A profile whose `SingletonLock` names a live process is left alone. The old shared `data/chrome-profile` path is not migrated, locked, or signaled, so an already-open window there is left alone.
+The operator sets `LOGIN_MCP_KEY` in the MCP process environment (the client `env` block or the service environment). login-mcp does not generate, rotate, or write this key. Do not commit it. If the running server has no key, leave it unset: there is no ciphertext, and the profile stays mode `0700` (files `0600`). If `LOGIN_MCP_KEY` is set, the per-site profile is decrypted only while that site's Chrome is running. It is encrypted again with scrypt and AES-256-GCM as soon as that site's browser closes (switching sites, the window closing, or process shutdown) and the plaintext directory is removed. If the key is unset, there is no ciphertext; the profile stays mode `0700` (files `0600`) at rest, including after the browser closes. The key is never logged. `SIGKILL` cannot run the close hook. On the next start, and again before a site browser is opened, a plaintext leftover is encrypted immediately when the key is set, or chmod'd to `0700`/`0600` when it is not. That pass does not delete the session. A profile whose `SingletonLock` names a live process is left alone. The old shared `data/chrome-profile` path is not migrated, locked, or signaled, so an already-open window there is left alone.
 
 ---
 
 도구마다 `site`가 필요합니다 (예: `wishket`). Chrome 프로필은 `data/sites/<site>/profile` 로 나뉩니다. 한 사이트 쿠키가 다른 사이트로 가지 않으며, 사이트 간 SSO는 의도적으로 깨집니다.
 
-`auth_confirm`은 에이전트 허용 목록이 아닙니다. 최근 10분 안에 사람이 허용해야 합니다.
+`auth_confirm`은 에이전트 허용 목록이 아니며, 허용 버튼을 누른 뒤에는 필요하지 않습니다. 최근 10분 안에 사람이 허용해야 합니다.
 
-1. `auth_login`이 연 로컬 탭에서 **이 사이트 허용**을 누릅니다. 작업 오리진(예: `https://auth.wishket.com` 와 `https://www.wishket.com`)을 그 사이트의 쌍으로 저장할 수 있습니다.
-2. 또는 대화형 터미널에서 `node dist/index.js confirm --site wishket --origin https://auth.wishket.com --work-origin https://www.wishket.com` 를 실행하고, Chrome 탭에만 보이는 코드를 입력합니다.
+1. `auth_login`이 연 로컬 탭은 버튼 앞에 로그인 오리진과 작업 오리진을 보여 줍니다. 등록 가능한 사이트 쌍이거나, 로컬 허용 서버가 아닌 http(s) 탭의 오리진입니다. 위시켓은 `https://auth.wishket.com` 와 `https://www.wishket.com` 입니다. **이 사이트 허용**을 누르면 신호를 기록하고 그 오리진을 바로 확인합니다. 성공 페이지는 **허용되었습니다** 입니다. 그 다음에 `auth_confirm`을 호출하지 않습니다.
+2. 또는 대화형 터미널에서 `node dist/index.js confirm --site wishket --origin https://auth.wishket.com --work-origin https://www.wishket.com` 를 실행하고, Chrome 탭에만 보이는 코드를 입력합니다. 이 명령은 신호만 기록합니다. 10분 안에 `auth_confirm`을 호출합니다.
 
 코드와 탭 주소는 MCP 도구 결과에 나오지 않습니다. 위조한 `human-signal.json`은 무시됩니다. 신호는 10분 뒤 만료됩니다. 확인되지 않은 오리진은 `auth_read`와 `auth_act`가 거부합니다.
 
-`LOGIN_MCP_KEY`가 있으면 그 사이트의 Chrome이 떠 있는 동안에만 프로필을 복호화합니다. 그 브라우저가 닫히면(사이트를 바꾸거나, 창을 닫거나, 프로세스가 종료되면) 바로 scrypt와 AES-256-GCM으로 다시 암호화하고 평문 디렉터리를 지웁니다. 키가 없으면 암호문은 없고, 브라우저가 닫힌 뒤에도 `0700`(파일 `0600`)만 유지합니다. 키는 로그에 남기지 않습니다. `SIGKILL`은 닫힘 훅을 실행할 수 없습니다. 다음 시작 때, 그리고 사이트를 열기 전에, 평문으로 남은 프로필은 키가 있으면 즉시 암호화하고 키가 없으면 `0700`/`0600`만 맞춥니다. 세션은 지우지 않습니다. `SingletonLock`이 살아 있는 프로세스를 가리키면 그 프로필은 그대로 둡니다. 예전 `data/chrome-profile`은 옮기거나 잠그거나 신호를 보내지 않습니다.
+`LOGIN_MCP_KEY`는 운영자가 MCP 프로세스 환경에 넣습니다. 이 프로그램은 키를 만들거나 파일로 쓰지 않습니다. 커밋하지 마세요. 실행 중인 서버에 키가 없으면 그대로 둡니다. `LOGIN_MCP_KEY`가 있으면 그 사이트의 Chrome이 떠 있는 동안에만 프로필을 복호화합니다. 그 브라우저가 닫히면(사이트를 바꾸거나, 창을 닫거나, 프로세스가 종료되면) 바로 scrypt와 AES-256-GCM으로 다시 암호화하고 평문 디렉터리를 지웁니다. 키가 없으면 암호문은 없고, 브라우저가 닫힌 뒤에도 `0700`(파일 `0600`)만 유지합니다. 키는 로그에 남기지 않습니다. `SIGKILL`은 닫힘 훅을 실행할 수 없습니다. 다음 시작 때, 그리고 사이트를 열기 전에, 평문으로 남은 프로필은 키가 있으면 즉시 암호화하고 키가 없으면 `0700`/`0600`만 맞춥니다. 세션은 지우지 않습니다. `SingletonLock`이 살아 있는 프로세스를 가리키면 그 프로필은 그대로 둡니다. 예전 `data/chrome-profile`은 옮기거나 잠그거나 신호를 보내지 않습니다.
 
 ## Security model
 
@@ -75,13 +75,13 @@ stdio transport. Point the host at the built entrypoint:
 }
 ```
 
-Logs go to stderr. stdout is reserved for MCP. Do not put the key on the command line.
+Logs go to stderr. stdout is reserved for MCP. Do not put the key on the command line. The operator sets `LOGIN_MCP_KEY` in that `env` block. If it is omitted, the server leaves the key unset and does not generate one.
 
 ## Tool flow
 
 1. `auth_status` with optional `{ "site": "wishket" }` — one line per site: site id, confirmed origins, last used time, last confirmed time, session age, and session `ok` or `needs_login`. No cookies, tokens, or query secrets.
-2. `auth_login` with `{ "site": "wishket", "url": "https://auth.example.com/login" }` — opens a visible Chrome window and returns immediately. Complete login yourself. Click **이 사이트 허용** or run the terminal confirm command. The server does not type credentials.
-3. `auth_confirm` with `{ "site": "wishket", "origin": "https://auth.example.com", "workOrigin": "https://www.example.com" }` — records the human-approved pair. Refuses when the human signal is missing or older than 10 minutes.
+2. `auth_login` with `{ "site": "wishket", "url": "https://auth.example.com/login" }` — opens a visible Chrome window and returns immediately. Complete login yourself. The local tab lists the login origin and the work origin, then **이 사이트 허용**. That click confirms them. The server does not type credentials. Do not call `auth_confirm` after the button.
+3. `auth_confirm` with `{ "site": "wishket", "origin": "https://auth.example.com", "workOrigin": "https://www.example.com" }` — for the terminal confirm command. Records the human-approved pair. Refuses when the human signal is missing or older than 10 minutes. Not required after **이 사이트 허용**.
 4. `auth_open` with `{ "site": "wishket", "url": "https://www.example.com/dashboard" }` — that site's profile only.
 5. `auth_read` with `{ "site": "wishket", "url": "...", "selector": "main" }` — visible text only. Refuses origins not confirmed for that site.
 6. `auth_act` with `{ "site": "wishket", "action": "click", "selector": "a[href='/settings']" }` — one click, fill, or key press. Password fields and challenge widgets are refused.
@@ -93,7 +93,7 @@ If a result contains `"human_action_required": true`, stop and use the open Chro
 | Variable | Default |
 | --- | --- |
 | `LOGIN_MCP_DATA_DIR` | `./data` |
-| `LOGIN_MCP_KEY` | unset (chmod `0700`/`0600` only; set it to encrypt a profile while its browser is closed) |
+| `LOGIN_MCP_KEY` | unset. The operator sets it in the MCP process environment. The server never generates or writes it. Unset means chmod `0700`/`0600` only. |
 
 Profiles are `$LOGIN_MCP_DATA_DIR/sites/<site>/profile`. `LOGIN_MCP_USER_DATA_DIR` is ignored so an older shared profile is not reused. Never point the data directory at a directory you commit, or at a Chrome profile path.
 

@@ -115,6 +115,7 @@ function fakeBrowser(
     profileExists: overrides.profileExists ?? (() => true),
     isOpen: overrides.isOpen ?? (() => false),
     openSite: overrides.openSite ?? (() => null),
+    listOpenTabUrls: () => [],
     close: overrides.close ?? (async () => {
       calls.push("close");
     }),

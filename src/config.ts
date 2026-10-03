@@ -7,6 +7,10 @@ export interface Config {
   encryptionKey: string | null;
 }
 
+/**
+ * Reads LOGIN_MCP_KEY from the process environment.
+ * Does not generate, rotate, or write a key. An unset key stays unset.
+ */
 export function readEncryptionKey(env: NodeJS.ProcessEnv = process.env): string | null {
   const raw = env.LOGIN_MCP_KEY;
   if (raw == null || raw.length === 0) return null;

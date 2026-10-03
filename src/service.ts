@@ -55,7 +55,7 @@ export interface Service {
 }
 
 const LOGIN_INSTRUCTIONS =
-  "Complete login in the Chrome window, including any 2FA or CAPTCHA. This server will not type your password or solve a challenge. Then click 이 사이트 허용 on the local confirmation tab, or run login-mcp confirm in a terminal and type the code shown in that tab. Within 10 minutes, call auth_confirm with this site id and origin. You may also pass the work origin the human entered.";
+  "Complete login in the Chrome window, including any 2FA or CAPTCHA. This server will not type your password or solve a challenge. Then click 이 사이트 허용 on the local confirmation tab. That click records the human allow signal and confirms the login origin and the work origin for this site. Do not call auth_confirm after the button. The terminal command login-mcp confirm only records the signal; call auth_confirm within 10 minutes after that command.";
 
 const SESSION_EXPIRED =
   "The session expired. A human must log in again in the Chrome window. Page text was not returned. Do not type a password.";
@@ -567,7 +567,7 @@ function originNotConfirmed(origin: string): ToolText {
         reason: "origin_not_confirmed",
         origin,
         human_action_required: true,
-        message: `Origin ${origin} is not confirmed for this site. Finish login in Chrome, allow the site, and call auth_confirm.`,
+        message: `Origin ${origin} is not confirmed for this site. Finish login in Chrome and click 이 사이트 허용, or call auth_confirm after the terminal confirm command.`,
       },
       null,
       2,

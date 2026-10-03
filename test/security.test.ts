@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import test from "node:test";
-import { confirmFromTerminal, createHumanSignals } from "../src/human-signal.ts";
+import { confirmFromTerminal, createHumanSignals, selectAllowOrigins } from "../src/human-signal.ts";
 import { createFileStore } from "../src/origins.ts";
 import { writePrivateJson } from "../src/private-file.ts";
 import { createService } from "../src/service.ts";
@@ -139,6 +139,118 @@ test("confirm records a human-approved origin pair and refuses a forged signal f
   await human.close();
 });
 
+test("selectAllowOrigins keeps the wishket login and work origins and drops the allow server", () => {
+  const tabs = [
+    "https://auth.wishket.com/login",
+    "https://www.wishket.com/projects?token=secret-token",
+    "http://127.0.0.1:9/allow/abc",
+    "about:blank",
+    "https://evil.example/bank",
+  ];
+  assert.deepEqual(
+    selectAllowOrigins({ loginOrigin: "https://www.wishket.com", tabUrls: tabs, allowPort: 9 }),
+    ["https://www.wishket.com", "https://auth.wishket.com"],
+  );
+  assert.deepEqual(
+    selectAllowOrigins({ loginOrigin: "https://auth.wishket.com", tabUrls: ["https://www.wishket.com/home"], allowPort: 9 }),
+    ["https://auth.wishket.com", "https://www.wishket.com"],
+  );
+  const picked = selectAllowOrigins({ loginOrigin: "https://auth.wishket.com", tabUrls: tabs, allowPort: 9 }).join(" ");
+  assert.equal(picked.includes("secret-token"), false);
+  assert.equal(picked.includes("127.0.0.1"), false);
+  assert.equal(picked.includes("evil.example"), false);
+  assert.deepEqual(
+    selectAllowOrigins({
+      loginOrigin: "https://auth.example",
+      explicitWorkOrigin: "https://www.example",
+    }),
+    ["https://auth.example", "https://www.example"],
+  );
+});
+
+test("allow button stores both origins and confirms them without asking for auth_confirm", async () => {
+  const dir = tempDir();
+  const store = createFileStore(dir);
+  let buttonCalls = 0;
+  let tabs = ["https://auth.wishket.com/login", "https://www.wishket.com/"];
+  const human = createHumanSignals({
+    dataDir: dir,
+    serve: true,
+    openTabUrls: () => tabs,
+    onButtonAllow: async (site, origins) => {
+      buttonCalls += 1;
+      assert.equal(site, "wishket");
+      await store.confirm(site, origins);
+      await store.touch(site, new Date(), undefined, { confirmed: true });
+    },
+  });
+  try {
+    const url = await human.beginLogin("wishket", "https://www.wishket.com");
+    assert.ok(url);
+    const allowPort = new URL(url).port;
+    tabs = [...tabs, `http://127.0.0.1:${allowPort}/allow/abc`, "about:blank"];
+    const html = await (await fetch(url)).text();
+    const buttonAt = html.indexOf(">이 사이트 허용</button>");
+    const authAt = html.indexOf("https://auth.wishket.com");
+    const wwwAt = html.indexOf("https://www.wishket.com");
+    assert.ok(buttonAt > authAt && authAt >= 0);
+    assert.ok(buttonAt > wwwAt && wwwAt >= 0);
+    assert.equal(html.includes("127.0.0.1"), false);
+    assert.equal(html.includes("auth_confirm"), false);
+
+    const posted = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ workOrigin: "" }),
+    });
+    assert.equal(posted.ok, true);
+    const body = await posted.text();
+    assert.match(body, /허용되었습니다/);
+    assert.equal(body.includes("auth_confirm"), false);
+    assert.equal(buttonCalls, 1);
+    assert.deepEqual(await human.assertRecent("wishket", ["https://auth.wishket.com", "https://www.wishket.com"]), [
+      "https://auth.wishket.com",
+      "https://www.wishket.com",
+    ]);
+    const listed = await store.list();
+    assert.deepEqual(listed[0]?.origins, ["https://auth.wishket.com", "https://www.wishket.com"]);
+    assert.equal(typeof listed[0]?.lastConfirmed, "string");
+
+    const again = await human.beginLogin("other", "https://other.example");
+    const againHtml = await (await fetch(again!)).text();
+    const againCode = /id="allow-code">([^<]+)/.exec(againHtml)?.[1];
+    assert.ok(againCode);
+    await confirmFromTerminal({
+      dataDir: dir,
+      site: "other",
+      origin: "https://other.example",
+      workOrigin: "https://work.example",
+      isTTY: true,
+      stdin: Readable.from([`${againCode}\n`]),
+      stdout: new Writable({
+        write(_chunk, _enc, cb) {
+          cb();
+        },
+      }),
+    });
+    assert.equal(buttonCalls, 1);
+    const after = await store.list();
+    const other = after.find((record) => record.site === "other");
+    assert.ok(other);
+    assert.deepEqual(other.origins, []);
+    assert.equal(other.lastConfirmed, null);
+    const wishket = after.find((record) => record.site === "wishket");
+    assert.deepEqual(wishket?.origins, ["https://auth.wishket.com", "https://www.wishket.com"]);
+    assert.equal(wishket?.lastConfirmed, listed[0]?.lastConfirmed);
+    assert.deepEqual(await human.assertRecent("other", ["https://other.example", "https://work.example"]), [
+      "https://other.example",
+      "https://work.example",
+    ]);
+  } finally {
+    await human.close();
+  }
+});
+
 test("localhost allow button and terminal code record a human signal", async () => {
   const dir = tempDir();
   const human = createHumanSignals({ dataDir: dir, serve: true });
@@ -230,6 +342,7 @@ function idleBrowser(): BrowserControl {
     profileExists: () => false,
     isOpen: () => false,
     openSite: () => null,
+    listOpenTabUrls: () => [],
     exclusive(_site, fn) {
       return fn(ops);
     },

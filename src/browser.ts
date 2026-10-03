@@ -44,6 +44,8 @@ export interface BrowserControl {
   profileExists(site: string): boolean;
   isOpen(): boolean;
   openSite(): string | null;
+  /** Open tab URLs. Does not take the browser mutex; safe while a navigation is in progress. */
+  listOpenTabUrls(): string[];
   exclusive<T>(site: string, fn: (ops: BrowserOps) => Promise<T>, options?: BrowserLaunchOptions): Promise<T>;
   close(): Promise<void>;
 }
@@ -119,6 +121,20 @@ export function createChromeBrowser(options: {
 
   function isOpen(): boolean {
     return context !== null && context.browser()?.isConnected() === true;
+  }
+
+  function listOpenTabUrls(): string[] {
+    if (!context || context.browser()?.isConnected() !== true) return [];
+    const urls: string[] = [];
+    for (const page of context.pages()) {
+      if (page.isClosed()) continue;
+      try {
+        urls.push(page.url());
+      } catch {
+        continue;
+      }
+    }
+    return urls;
   }
 
   function lockProfile(site: string, reason: "browser_closed" | "process_exit" | "relaunch"): void {
@@ -416,6 +432,7 @@ export function createChromeBrowser(options: {
     openSite() {
       return isOpen() ? currentSite : null;
     },
+    listOpenTabUrls,
     exclusive<T>(site: string, fn: (ops: BrowserOps) => Promise<T>, launch?: BrowserLaunchOptions): Promise<T> {
       return lock(async () => {
         if (launch?.pins) await alignPins(site, launch.pins, launch.relaunch !== false);

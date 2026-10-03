@@ -7,10 +7,11 @@ import { createProfileVault, sealLeftoverProfiles } from "./vault.js";
 import { getConfig } from "./config.js";
 import { confirmFromTerminal, createHumanSignals } from "./human-signal.js";
 import { createFileStore } from "./origins.js";
+import { assertPinnedHost, defaultResolveHost } from "./policy.js";
 import { createService, type ToolText } from "./service.js";
 
 const INSTRUCTIONS =
-  "Reuse a human-completed Chrome login for one site id at a time. Profiles are not shared across sites. Never type, store, or request passwords. Never export cookies or storage. auth_confirm works only after the human clicks 이 사이트 허용 or types the confirmation code in a terminal, and only for 10 minutes. If a tool returns human_action_required, stop and let the human finish in the open Chrome window. Do not solve CAPTCHA, 2FA, or bot checks. If a navigation is refused because it left the confirmed origins, do not retry it or ask for the page text.";
+  "Reuse a human-completed Chrome login for one site id at a time. Profiles are not shared across sites. Never type, store, or request passwords. Never export cookies or storage. The 이 사이트 허용 button records the human allow signal and confirms the login and work origins immediately. auth_confirm remains for the terminal confirm command and only works for 10 minutes after that signal. If a tool returns human_action_required, stop and let the human finish in the open Chrome window. Do not solve CAPTCHA, 2FA, or bot checks. If a navigation is refused because it left the confirmed origins, do not retry it or ask for the page text.";
 
 const siteField = z
   .string()
@@ -55,7 +56,7 @@ async function main(): Promise<void> {
   }
   if (!config.encryptionKey) {
     console.error(
-      "[login-mcp] LOGIN_MCP_KEY is unset. Profiles stay mode 0700/0600. Set LOGIN_MCP_KEY to encrypt a profile when its browser closes. SIGKILL cannot run that hook; the next start seals a leftover plaintext profile.",
+      "[login-mcp] LOGIN_MCP_KEY is unset. This process will not generate or write a key. Leave it unset unless the operator set LOGIN_MCP_KEY in the MCP process environment. Profiles stay mode 0700/0600. SIGKILL cannot run the close hook; the next start seals a leftover plaintext profile.",
     );
   }
   sealLeftoverProfiles(createProfileVault(config.encryptionKey), config.dataDir);
@@ -63,9 +64,22 @@ async function main(): Promise<void> {
     dataDir: config.dataDir,
     encryptionKey: config.encryptionKey,
   });
-  const human = createHumanSignals({ dataDir: config.dataDir, serve: true });
+  const store = createFileStore(config.dataDir);
+  const human = createHumanSignals({
+    dataDir: config.dataDir,
+    serve: true,
+    openTabUrls: () => browser.listOpenTabUrls(),
+    onButtonAllow: async (site, origins) => {
+      for (const origin of origins) {
+        await assertPinnedHost(new URL(origin).hostname, defaultResolveHost);
+      }
+      await store.confirm(site, origins);
+      await store.touch(site, new Date(), undefined, { confirmed: true });
+      console.error(`[login-mcp] allow confirmed site=${site} origins=${origins.join(",")}`);
+    },
+  });
   const service = createService({
-    store: createFileStore(config.dataDir),
+    store,
     browser,
     human,
     dataDir: config.dataDir,
@@ -94,7 +108,7 @@ async function main(): Promise<void> {
     "auth_login",
     {
       description:
-        "Open a visible Chrome window for one site id so a human can log in. Also opens a local tab with the button 이 사이트 허용. Returns immediately. Does not type credentials or return the confirmation code.",
+        "Open a visible Chrome window for one site id so a human can log in. Also opens a local tab that lists the login origin and work origin, then the button 이 사이트 허용. That button confirms those origins. Returns immediately. Does not type credentials or return the confirmation code.",
       inputSchema: {
         site: siteField,
         url: z.string().describe("Absolute http(s) URL of the login page the human will complete."),
@@ -107,7 +121,7 @@ async function main(): Promise<void> {
     "auth_confirm",
     {
       description:
-        "Record origins for one site after a human allow signal from the last 10 minutes (the 이 사이트 허용 button or login-mcp confirm). Refuses if that signal is missing. Optional workOrigin must be part of the same human signal. Does not read cookies.",
+        "Record origins for one site after a human allow signal from the last 10 minutes. The 이 사이트 허용 button already confirms origins; use this after the terminal confirm command. Refuses if that signal is missing. Optional workOrigin must be part of the same human signal. Does not read cookies.",
       inputSchema: {
         site: siteField,
         origin: z.string().describe("Login origin the human allowed, exactly like https://auth.example.com, with no path."),

@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import { isIP } from "node:net";
 import readline from "node:readline/promises";
-import { assertOrigin } from "./policy.js";
+import { assertOrigin, PolicyError } from "./policy.js";
 import { isNotFound, readPrivateJson, writePrivateJson } from "./private-file.js";
 import { assertSiteId, resolveSitePaths, SitePathError } from "./site-path.js";
 
@@ -28,6 +29,8 @@ interface Challenge {
   code: string;
   site: string;
   origin: string;
+  /** Origins already seen on http(s) tabs. Queries are not kept. */
+  seenOrigins: string[];
   exp: number;
 }
 
@@ -58,6 +61,120 @@ function isLoopback(address: string | undefined): boolean {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
+/** Common multi-label public suffixes. Enough to pair auth/www on wishket.com and on *.co.kr. Not a full PSL. */
+const MULTI_PART_PUBLIC_SUFFIX = new Set([
+  "co.kr", "or.kr", "ne.kr", "go.kr", "ac.kr", "re.kr", "pe.kr",
+  "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk",
+  "com.au", "net.au", "org.au", "edu.au",
+  "co.jp", "ne.jp", "or.jp", "ac.jp",
+  "com.br", "com.cn", "co.nz", "co.za", "com.mx", "com.tr",
+  "co.in", "com.sg", "com.hk", "com.tw",
+  "co.id", "com.ar",
+]);
+
+const IDP_LABEL = /^(?:auth|login|signin|sign-in|accounts|account|id|sso|passport)$/i;
+
+/** Registrable site (eTLD+1-style) used to pair a login origin with its work origin. */
+export function registrableSite(hostname: string): string {
+  const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  if (host.length === 0) return host;
+  if (isIP(host) !== 0) return host;
+  const labels = host.split(".").filter((label) => label.length > 0);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  if (MULTI_PART_PUBLIC_SUFFIX.has(lastTwo)) return labels.slice(-3).join(".");
+  return lastTwo;
+}
+
+function originFromTabUrl(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  try {
+    return assertOrigin(url.origin);
+  } catch {
+    return null;
+  }
+}
+
+function isLocalAllowServer(origin: string, port: number): boolean {
+  if (!port) return false;
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") return false;
+  const inferred = url.port || (url.protocol === "https:" ? "443" : "80");
+  return inferred === String(port);
+}
+
+function isIdpHost(hostname: string): boolean {
+  const first = hostname.replace(/\.$/, "").toLowerCase().split(".")[0] ?? "";
+  return IDP_LABEL.test(first);
+}
+
+function preferWorkOrigin(loginOrigin: string, candidates: readonly string[]): string {
+  const loginIsIdp = isIdpHost(new URL(loginOrigin).hostname);
+  const scored = candidates.map((origin) => {
+    const host = new URL(origin).hostname.toLowerCase();
+    let score = 5;
+    if (loginIsIdp) {
+      if (host.startsWith("www.")) score = 0;
+      else if (!isIdpHost(host)) score = 1;
+      else score = 3;
+    } else if (isIdpHost(host)) score = 0;
+    else if (host.startsWith("www.")) score = 1;
+    return { origin, score };
+  });
+  scored.sort((a, b) => a.score - b.score || a.origin.localeCompare(b.origin));
+  return scored[0]!.origin;
+}
+
+/**
+ * Login origin plus one work origin.
+ * The work origin is an explicit value, otherwise a registrable-site pair taken from
+ * open http(s) tabs. The local allow server is never included.
+ */
+export function selectAllowOrigins(input: {
+  loginOrigin: string;
+  tabUrls?: readonly string[];
+  allowPort?: number;
+  explicitWorkOrigin?: string | null;
+}): string[] {
+  const login = assertOrigin(input.loginOrigin);
+  const site = registrableSite(new URL(login).hostname);
+  const paired: string[] = [];
+  const otherTabs: string[] = [];
+  const seen = new Set<string>([login]);
+  for (const raw of input.tabUrls ?? []) {
+    const origin = originFromTabUrl(raw);
+    if (!origin || seen.has(origin)) continue;
+    if (input.allowPort && isLocalAllowServer(origin, input.allowPort)) continue;
+    seen.add(origin);
+    if (registrableSite(new URL(origin).hostname) === site) paired.push(origin);
+    else otherTabs.push(origin);
+  }
+  const explicitRaw = input.explicitWorkOrigin?.trim() ?? "";
+  if (explicitRaw.length > 0) {
+    const explicit = assertOrigin(explicitRaw);
+    return explicit === login ? [login] : [login, explicit];
+  }
+  if (paired.length > 0) return [login, preferWorkOrigin(login, paired)];
+  // No registrable pair: one other http(s) tab, and not the local allow server.
+  if (otherTabs.length === 1) return [login, otherTabs[0]!];
+  return [login];
+}
+
+const ALLOW_SUCCESS_HTML =
+  "<!doctype html><meta charset=utf-8><title>허용됨</title><p>허용되었습니다.</p>";
+
 interface SignalFile {
   site: string;
   origins: string[];
@@ -70,6 +187,10 @@ export function createHumanSignals(options: {
   serve?: boolean;
   now?: () => number;
   ttlMs?: number;
+  /** Open http(s) tab URLs. Must not take the browser mutex (the allow page loads during navigation). */
+  openTabUrls?: () => readonly string[];
+  /** Button path only. Records the signal and confirms those origins immediately. */
+  onButtonAllow?: (site: string, origins: string[]) => Promise<void>;
 }): HumanSignals {
   const now = options.now ?? (() => Date.now());
   const ttlMs = options.ttlMs ?? HUMAN_SIGNAL_TTL_MS;
@@ -146,9 +267,35 @@ export function createHumanSignals(options: {
     return stored;
   }
 
+  function currentTabUrls(): readonly string[] {
+    try {
+      return options.openTabUrls?.() ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  function rememberTabs(challenge: Challenge): void {
+    const merged = [...challenge.seenOrigins];
+    for (const raw of currentTabUrls()) {
+      const origin = originFromTabUrl(raw);
+      if (origin && !merged.includes(origin)) merged.push(origin);
+    }
+    challenge.seenOrigins = merged;
+  }
+
+  function originsFor(challenge: Challenge, explicitWorkOrigin?: string | null): string[] {
+    rememberTabs(challenge);
+    return selectAllowOrigins({
+      loginOrigin: challenge.origin,
+      tabUrls: challenge.seenOrigins,
+      allowPort: port,
+      explicitWorkOrigin,
+    });
+  }
+
   async function approveFromChallenge(challenge: Challenge, workOrigin: string | undefined): Promise<void> {
-    const origins = [challenge.origin];
-    if (workOrigin && workOrigin.trim().length > 0) origins.push(workOrigin.trim());
+    const origins = originsFor(challenge, workOrigin);
     await allow(challenge.site, origins);
     challenges.delete(challenge.nonce);
   }
@@ -196,7 +343,12 @@ export function createHumanSignals(options: {
     const bound = await ensureServer();
     const nonce = crypto.randomBytes(32).toString("hex");
     const code = normalizeCode(shortCode());
-    challenges.set(nonce, { nonce, code, site: id, origin: valid, exp: now() + ttlMs });
+    const seenOrigins: string[] = [];
+    for (const raw of currentTabUrls()) {
+      const origin = originFromTabUrl(raw);
+      if (origin && !seenOrigins.includes(origin)) seenOrigins.push(origin);
+    }
+    challenges.set(nonce, { nonce, code, site: id, origin: valid, seenOrigins, exp: now() + ttlMs });
     return `http://127.0.0.1:${bound}/allow/${nonce}`;
   }
 
@@ -269,7 +421,16 @@ export function createHumanSignals(options: {
       return;
     }
     if (req.method === "GET") {
+      let origins: string[];
+      try {
+        origins = originsFor(challenge);
+      } catch {
+        res.writeHead(400, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        res.end("The work origin was rejected.");
+        return;
+      }
       const display = `${challenge.code.slice(0, 4)}-${challenge.code.slice(4, 8)}-${challenge.code.slice(8, 12)}`;
+      const items = origins.map((origin) => `<li><strong>${escapeHtml(origin)}</strong></li>`).join("");
       const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
@@ -277,11 +438,12 @@ export function createHumanSignals(options: {
 <style>body{font-family:sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}code{font-size:1.3rem}</style>
 <h1>이 사이트 허용</h1>
 <p>사이트 <strong>${escapeHtml(challenge.site)}</strong></p>
-<p>로그인 오리진 <strong>${escapeHtml(challenge.origin)}</strong></p>
+<p>허용할 오리진</p>
+<ul id="allow-origins">${items}</ul>
 <p>터미널에서 확인하려면 이 코드를 입력하세요.</p>
 <p><code id="allow-code">${escapeHtml(display)}</code></p>
 <form method="post">
-<label>작업 오리진 (선택) <input name="workOrigin" placeholder="https://www.example.com" size="40" maxlength="200"></label>
+<label>작업 오리진 (목록에 없을 때만) <input name="workOrigin" placeholder="https://www.example.com" size="40" maxlength="200"></label>
 <p><button type="submit">이 사이트 허용</button></p>
 </form>`;
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -291,15 +453,31 @@ export function createHumanSignals(options: {
     if (req.method === "POST") {
       const body = await readBody(req);
       const form = new URLSearchParams(body);
+      let origins: string[];
       try {
-        await approveFromChallenge(challenge, form.get("workOrigin") ?? undefined);
+        origins = originsFor(challenge, form.get("workOrigin"));
+        await allow(challenge.site, origins);
       } catch {
         res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
         res.end("The work origin was rejected.");
         return;
       }
+      if (options.onButtonAllow) {
+        try {
+          await options.onButtonAllow(challenge.site, origins);
+        } catch (error) {
+          const message =
+            error instanceof PolicyError || error instanceof HumanSignalError
+              ? error.message
+              : "The origins could not be confirmed.";
+          res.writeHead(400, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+          res.end(message);
+          return;
+        }
+      }
+      challenges.delete(challenge.nonce);
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      res.end("<!doctype html><meta charset=utf-8><title>허용됨</title><p>허용했습니다. 10분 안에 auth_confirm을 호출하세요.</p>");
+      res.end(ALLOW_SUCCESS_HTML);
       return;
     }
     res.writeHead(405, { "content-type": "text/plain; charset=utf-8" });
