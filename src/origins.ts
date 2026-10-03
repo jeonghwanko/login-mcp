@@ -1,55 +1,53 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
-import path from "node:path";
 import { createMutex } from "./mutex.js";
 import { assertOrigin } from "./policy.js";
+import { isNotFound, readPrivateJson, writePrivateJson } from "./private-file.js";
+import { listSiteIds, resolveSitePaths, type SitePaths } from "./site-path.js";
 import { mayTighten } from "./session-path.js";
 
-export interface OriginStore {
-  list(): Promise<string[]>;
-  has(origin: string): Promise<boolean>;
-  confirm(origin: string): Promise<string[]>;
-}
-
-interface OriginsFile {
+export interface SiteRecord {
+  site: string;
   origins: string[];
+  lastUsed: string | null;
 }
 
-const MAX_ORIGINS_BYTES = 256 * 1024;
+export interface OriginStore {
+  list(): Promise<SiteRecord[]>;
+  has(site: string, origin: string): Promise<boolean>;
+  confirm(site: string, origins: string[]): Promise<string[]>;
+  touch(site: string, when?: Date): Promise<string>;
+}
+
 const MAX_ORIGINS = 1000;
 
 const locks = new Map<string, <T>(fn: () => Promise<T>) => Promise<T>>();
 
-function fileLock(file: string): <T>(fn: () => Promise<T>) => Promise<T> {
-  const key = path.resolve(file);
-  let lock = locks.get(key);
+function siteLock(root: string): <T>(fn: () => Promise<T>) => Promise<T> {
+  let lock = locks.get(root);
   if (!lock) {
     lock = createMutex();
-    locks.set(key, lock);
+    locks.set(root, lock);
   }
   return lock;
 }
 
-export async function readOrigins(file: string): Promise<string[]> {
-  let raw: string;
-  try {
-    raw = await readRegularFile(file);
-  } catch (error) {
-    if (isNotFound(error)) return [];
-    throw error;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("Origins file is not valid JSON. Refusing to read it.");
-  }
-  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as OriginsFile).origins)) {
+async function ensureSite(dataDir: string, site: string): Promise<SitePaths> {
+  const paths = resolveSitePaths(dataDir, site);
+  await fsPromises.mkdir(paths.root, { recursive: true, mode: 0o700 });
+  const created = resolveSitePaths(dataDir, site);
+  if (mayTighten(created.root)) await fsPromises.chmod(created.root, 0o700);
+  return created;
+}
+
+async function readOrigins(file: string): Promise<string[]> {
+  const parsed = await readPrivateJson(file);
+  if (parsed === undefined) return [];
+  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { origins?: unknown }).origins)) {
     throw new Error("Origins file has an unexpected shape. Refusing to read it.");
   }
   const origins: string[] = [];
-  for (const entry of (parsed as OriginsFile).origins) {
+  for (const entry of (parsed as { origins: unknown[] }).origins) {
     if (typeof entry !== "string") continue;
     try {
       const origin = assertOrigin(entry);
@@ -62,106 +60,76 @@ export async function readOrigins(file: string): Promise<string[]> {
   return origins;
 }
 
-export function createFileStore(file: string): OriginStore {
-  const lock = fileLock(file);
+async function readLastUsed(file: string): Promise<string | null> {
+  const parsed = await readPrivateJson(file);
+  if (!parsed || typeof parsed !== "object") return null;
+  const value = (parsed as { lastUsed?: unknown }).lastUsed;
+  if (typeof value !== "string" || value.length === 0 || value.length > 40) return null;
+  return value;
+}
+
+export function createFileStore(dataDir: string): OriginStore {
   return {
-    list: () => lock(() => readOrigins(file)),
-    async has(origin: string) {
-      const origins = await lock(() => readOrigins(file));
+    async list() {
+      const records: SiteRecord[] = [];
+      for (const id of listSiteIds(dataDir)) {
+        const paths = resolveSitePaths(dataDir, id);
+        records.push({
+          site: id,
+          origins: await readOrigins(paths.origins),
+          lastUsed: await readLastUsed(paths.meta),
+        });
+      }
+      return records;
+    },
+    async has(site: string, origin: string) {
+      const paths = resolveSitePaths(dataDir, site);
+      const origins = await readOrigins(paths.origins);
       return origins.includes(origin);
     },
-    async confirm(origin: string) {
-      const valid = assertOrigin(origin);
-      return lock(async () => {
-        await dropOwnedSymlink(file);
-        const origins = await readOrigins(file);
-        if (!origins.includes(valid)) origins.push(valid);
-        if (origins.length > MAX_ORIGINS) {
-          throw new Error("Too many confirmed origins.");
+    async confirm(site: string, origins: string[]) {
+      const valid = [...new Set(origins.map((origin) => assertOrigin(origin)))].sort();
+      if (valid.length === 0) throw new Error("No origin to confirm.");
+      const paths = await ensureSite(dataDir, site);
+      return siteLock(paths.root)(async () => {
+        try {
+          const st = await fsPromises.lstat(paths.origins);
+          if (st.isSymbolicLink()) await fsPromises.unlink(paths.origins);
+        } catch (error) {
+          if (!isNotFound(error)) throw error;
         }
-        origins.sort();
-        await atomicWrite(file, JSON.stringify({ origins }, null, 2) + "\n");
-        return origins;
+        const existing = await readOrigins(paths.origins);
+        for (const origin of valid) {
+          if (!existing.includes(origin)) existing.push(origin);
+        }
+        if (existing.length > MAX_ORIGINS) throw new Error("Too many confirmed origins.");
+        existing.sort();
+        await writePrivateJson(paths.origins, { origins: existing });
+        return existing;
       });
+    },
+    async touch(site: string, when: Date = new Date()) {
+      const paths = await ensureSite(dataDir, site);
+      const lastUsed = when.toISOString();
+      await siteLock(paths.root)(async () => {
+        await writePrivateJson(paths.meta, { lastUsed });
+      });
+      return lastUsed;
     },
   };
 }
 
-async function readRegularFile(file: string): Promise<string> {
-  const st = await fsPromises.lstat(file);
-  if (st.isSymbolicLink()) {
-    throw new Error("Origins file must not be a symlink.");
-  }
-  if (!st.isFile()) {
-    throw new Error("Origins path is not a regular file.");
-  }
-  if (st.size > MAX_ORIGINS_BYTES) {
-    throw new Error("Origins file is too large.");
-  }
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
-  const fh = await fsPromises.open(file, flags);
+export function profileLooksPresent(paths: SitePaths): boolean {
   try {
-    await fh.chmod(0o600);
-    const after = await fh.stat();
-    if ((after.mode & 0o077) !== 0) {
-      throw new Error("Origins file is readable by other users and could not be locked down.");
-    }
-    return await fh.readFile({ encoding: "utf8" });
-  } finally {
-    await fh.close();
-  }
-}
-
-async function dropOwnedSymlink(file: string): Promise<void> {
-  let st: fs.Stats;
-  try {
-    st = await fsPromises.lstat(file);
-  } catch (error) {
-    if (isNotFound(error)) return;
-    throw error;
-  }
-  if (!st.isSymbolicLink()) return;
-  try {
-    await fsPromises.unlink(file);
+    const profile = fs.lstatSync(paths.profile);
+    if (!profile.isSymbolicLink() && profile.isDirectory()) return true;
   } catch {
-    throw new Error("Origins file must not be a symlink.");
+    // missing profile
   }
-}
-
-async function atomicWrite(file: string, body: string): Promise<void> {
-  const dir = path.dirname(file);
-  await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 });
-  if (mayTighten(dir)) {
-    await fsPromises.chmod(dir, 0o700);
-  }
-  const tmp = path.join(
-    dir,
-    `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`,
-  );
-  const fh = await fsPromises.open(tmp, "wx", 0o600);
   try {
-    await fh.chmod(0o600);
-    await fh.writeFile(body);
-    await fh.sync();
-  } catch (error) {
-    await fh.close().catch(() => undefined);
-    await fsPromises.unlink(tmp).catch(() => undefined);
-    throw error;
+    const vault = fs.lstatSync(paths.vault);
+    return vault.isFile() && !vault.isSymbolicLink();
+  } catch {
+    return false;
   }
-  await fh.close();
-  await fsPromises.rename(tmp, file);
-  await fsPromises.chmod(file, 0o600);
-  const mode = (await fsPromises.stat(file)).mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    throw new Error("Origins file is readable by other users and could not be locked down.");
-  }
-}
-
-function isNotFound(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "ENOENT"
-  );
 }

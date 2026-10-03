@@ -3,8 +3,17 @@ import { assertSafeConfig } from "./session-path.js";
 
 export interface Config {
   dataDir: string;
-  userDataDir: string;
-  originsFile: string;
+  /** Null when LOGIN_MCP_KEY is unset. Never log this value. */
+  encryptionKey: string | null;
+}
+
+export function readEncryptionKey(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env.LOGIN_MCP_KEY;
+  if (raw == null || raw.length === 0) return null;
+  if (raw.length > 4096) {
+    throw new Error("LOGIN_MCP_KEY is too long.");
+  }
+  return raw;
 }
 
 export function getConfig(
@@ -12,11 +21,9 @@ export function getConfig(
   cwd: string = process.cwd(),
 ): Config {
   const dataDir = env.LOGIN_MCP_DATA_DIR || path.join(cwd, "data");
-  const config: Config = {
+  assertSafeConfig({ dataDir });
+  return {
     dataDir,
-    userDataDir: env.LOGIN_MCP_USER_DATA_DIR || path.join(dataDir, "chrome-profile"),
-    originsFile: env.LOGIN_MCP_ORIGINS_FILE || path.join(dataDir, "origins.json"),
+    encryptionKey: readEncryptionKey(env),
   };
-  assertSafeConfig(config);
-  return config;
 }

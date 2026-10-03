@@ -4,11 +4,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { createChromeBrowser } from "./browser.js";
 import { getConfig } from "./config.js";
+import { confirmFromTerminal, createHumanSignals } from "./human-signal.js";
 import { createFileStore } from "./origins.js";
 import { createService, type ToolText } from "./service.js";
 
 const INSTRUCTIONS =
-  "Reuse a human-completed Chrome login. Never type, store, or request passwords. Never export cookies or storage. If a tool returns human_action_required, stop and let the human finish in the open Chrome window. Do not solve CAPTCHA, 2FA, or bot checks. If a navigation is refused because it left the confirmed origins, do not retry it or ask for the page text.";
+  "Reuse a human-completed Chrome login for one site id at a time. Profiles are not shared across sites. Never type, store, or request passwords. Never export cookies or storage. auth_confirm works only after the human clicks 이 사이트 허용 or types the confirmation code in a terminal, and only for 10 minutes. If a tool returns human_action_required, stop and let the human finish in the open Chrome window. Do not solve CAPTCHA, 2FA, or bot checks. If a navigation is refused because it left the confirmed origins, do not retry it or ask for the page text.";
+
+const siteField = z
+  .string()
+  .describe("Site id: 1-64 characters of a-z, 0-9, underscore, or hyphen. Each site has its own Chrome profile.");
 
 function toContent(result: ToolText) {
   return {
@@ -17,12 +22,51 @@ function toContent(result: ToolText) {
   };
 }
 
-async function main(): Promise<void> {
+function argValue(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  if (index === -1) return undefined;
+  return args[index + 1];
+}
+
+async function runCliConfirm(args: string[]): Promise<void> {
   const config = getConfig();
-  const browser = createChromeBrowser(config);
+  await confirmFromTerminal({
+    dataDir: config.dataDir,
+    site: argValue(args, "--site"),
+    origin: argValue(args, "--origin"),
+    workOrigin: argValue(args, "--work-origin"),
+    isTTY: Boolean(process.stdin.isTTY),
+    stdin: process.stdin,
+    stdout: process.stderr,
+  });
+  console.error("[login-mcp] human allow signal recorded");
+}
+
+async function main(): Promise<void> {
+  if (process.argv[2] === "confirm") {
+    await runCliConfirm(process.argv.slice(3));
+    return;
+  }
+
+  const config = getConfig();
+  if (process.env.LOGIN_MCP_USER_DATA_DIR) {
+    console.error("[login-mcp] LOGIN_MCP_USER_DATA_DIR is ignored. Profiles live under data/sites/<site>/profile.");
+  }
+  if (!config.encryptionKey) {
+    console.error(
+      "[login-mcp] LOGIN_MCP_KEY is unset. Profiles are chmod 0700 only. Set LOGIN_MCP_KEY for scrypt + AES-256-GCM at rest.",
+    );
+  }
+  const browser = createChromeBrowser({
+    dataDir: config.dataDir,
+    encryptionKey: config.encryptionKey,
+  });
+  const human = createHumanSignals({ dataDir: config.dataDir, serve: true });
   const service = createService({
-    store: createFileStore(config.originsFile),
+    store: createFileStore(config.dataDir),
     browser,
+    human,
+    dataDir: config.dataDir,
     log: (line) => console.error(line),
   });
 
@@ -35,68 +79,80 @@ async function main(): Promise<void> {
     "auth_status",
     {
       description:
-        "Report whether the local Chrome profile exists, whether Chrome is open under this server, and which site origins the human has confirmed. Returns origins only, never cookies or tokens.",
+        "List site ids, human-confirmed origins, and roughly when each profile was last used. Returns no cookies or tokens.",
+      inputSchema: {
+        site: siteField.optional().describe("Optional site id. Omit to list every site."),
+      },
       annotations: { readOnlyHint: true },
     },
-    async () => toContent(await service.status()),
+    async ({ site }) => toContent(await service.status(site)),
   );
 
   server.registerTool(
     "auth_login",
     {
       description:
-        "Open a visible Chrome window at a URL using the persistent local profile so a human can log in. Returns immediately and does not type credentials, wait for login, or store a password.",
+        "Open a visible Chrome window for one site id so a human can log in. Also opens a local tab with the button 이 사이트 허용. Returns immediately. Does not type credentials or return the confirmation code.",
       inputSchema: {
+        site: siteField,
         url: z.string().describe("Absolute http(s) URL of the login page the human will complete."),
       },
     },
-    async ({ url }) => toContent(await service.login(url)),
+    async ({ site, url }) => toContent(await service.login(site, url)),
   );
 
   server.registerTool(
     "auth_confirm",
     {
       description:
-        "Record that the human finished login for one origin. Pass only the origin, such as https://example.com. Does not read cookies.",
+        "Record origins for one site after a human allow signal from the last 10 minutes (the 이 사이트 허용 button or login-mcp confirm). Refuses if that signal is missing. Optional workOrigin must be part of the same human signal. Does not read cookies.",
       inputSchema: {
-        origin: z.string().describe("Confirmed site origin, exactly like https://example.com, with no path."),
+        site: siteField,
+        origin: z.string().describe("Login origin the human allowed, exactly like https://auth.example.com, with no path."),
+        workOrigin: z
+          .string()
+          .optional()
+          .describe("Optional work origin the human allowed for this site, such as https://www.example.com."),
       },
     },
-    async ({ origin }) => toContent(await service.confirm(origin)),
+    async ({ site, origin, workOrigin }) => toContent(await service.confirm(site, origin, workOrigin)),
   );
 
   server.registerTool(
     "auth_open",
     {
       description:
-        "Open a URL in the persistent Chrome profile. The origin must already be confirmed. Returns the title, final URL, and human_action_required when the page looks like a login or challenge. Does not try to log in.",
+        "Open a URL in that site's Chrome profile. The origin must already be human-confirmed for the site. Returns human_action_required and no page text when the page looks like a login or challenge.",
       inputSchema: {
-        url: z.string().describe("Absolute http(s) URL on a confirmed origin."),
+        site: siteField,
+        url: z.string().describe("Absolute http(s) URL on a confirmed origin for this site."),
       },
     },
-    async ({ url }) => toContent(await service.open(url)),
+    async ({ site, url }) => toContent(await service.open(site, url)),
   );
 
   server.registerTool(
     "auth_read",
     {
       description:
-        "Read visible text from the current page, or navigate first when url is set and its origin is confirmed. Optional selector reads that element's inner text. Truncates long text. Never returns cookies or storage.",
+        "Read visible text from this site's current page, or navigate first when url is set and its origin is human-confirmed for the site. Refuses unconfirmed origins. Truncates long text. Never returns cookies or storage.",
       inputSchema: {
-        url: z.string().optional().describe("Optional absolute http(s) URL on a confirmed origin."),
+        site: siteField,
+        url: z.string().optional().describe("Optional absolute http(s) URL on a confirmed origin for this site."),
         selector: z.string().optional().describe("Optional Playwright selector whose visible text to read."),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ url, selector }) => toContent(await service.read({ url, selector })),
+    async ({ site, url, selector }) => toContent(await service.read(site, { url, selector })),
   );
 
   server.registerTool(
     "auth_act",
     {
       description:
-        "Perform one click, fill, or press on the current page. Refuses unconfirmed origins, password fields, and challenge widgets. fill and press require value. Does not solve CAPTCHA or 2FA.",
+        "Perform one click, fill, or press on this site's current page. Refuses unconfirmed origins, password fields, and challenge widgets. fill and press require value. Does not solve CAPTCHA or 2FA.",
       inputSchema: {
+        site: siteField,
         action: z.enum(["click", "fill", "press"]).describe("The single action to perform."),
         selector: z.string().describe("Playwright selector for the element. Password fields are refused."),
         value: z
@@ -105,16 +161,13 @@ async function main(): Promise<void> {
           .describe("Text for fill, or key for press. Never a password. Required for fill and press."),
       },
     },
-    async ({ action, selector, value }) => toContent(await service.act({ action, selector, value })),
+    async ({ site, action, selector, value }) =>
+      toContent(await service.act(site, { action, selector, value })),
   );
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[login-mcp] listening on stdio");
-
-  server.server.onclose = () => {
-    void browser.close();
-  };
 
   let shuttingDown = false;
   const shutdown = () => {
@@ -123,18 +176,27 @@ async function main(): Promise<void> {
     const timer = setTimeout(() => {
       console.error("[login-mcp] shutdown timed out");
       process.exit(1);
-    }, 5000);
-    void browser.close().finally(() => {
-      clearTimeout(timer);
-      process.exit(0);
-    });
+    }, 60_000);
+    void human
+      .close()
+      .catch(() => undefined)
+      .then(() => browser.close())
+      .finally(() => {
+        clearTimeout(timer);
+        process.exit(0);
+      });
+  };
+  server.server.onclose = () => {
+    shutdown();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
 
 main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
+  let message = error instanceof Error ? error.message : String(error);
+  const key = process.env.LOGIN_MCP_KEY;
+  if (key) message = message.split(key).join("[redacted]");
   console.error(`[login-mcp] fatal ${message}`);
   process.exit(1);
 });

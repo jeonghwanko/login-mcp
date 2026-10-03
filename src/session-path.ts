@@ -4,8 +4,6 @@ import path from "node:path";
 
 export interface SessionPaths {
   dataDir: string;
-  userDataDir: string;
-  originsFile: string;
 }
 
 function reservedProfileDirs(): string[] {
@@ -59,10 +57,15 @@ export function mayTighten(dir: string): boolean {
 }
 
 export function assertSafeConfig(config: SessionPaths): void {
-  assertNotReserved("data directory", config.dataDir);
-  assertNotReserved("profile directory", config.userDataDir);
-  assertNotReserved("origins file", config.originsFile);
-  assertNotReserved("origins directory", path.dirname(config.originsFile));
+  const dataDir = path.resolve(config.dataDir);
+  assertNotReserved("data directory", dataDir);
+  assertNotReserved("sites directory", path.join(dataDir, "sites"));
+  if (!mayTighten(dataDir)) {
+    throw new Error(`Refusing to keep session data in ${dataDir}. Use a dedicated directory.`);
+  }
+  if (path.basename(dataDir) === "chrome-profile") {
+    throw new Error("Refusing to use a Chrome profile directory as the data directory.");
+  }
 }
 
 /**

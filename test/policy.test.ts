@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   PolicyError,
   assertOrigin,
+  assertPinnedHost,
   elementIsChallenge,
   elementIsPassword,
   looksLikeChallengeWidget,
@@ -195,5 +196,43 @@ test("element facts catch password and challenge nodes selectors can hide", () =
       role: null,
     }),
     false,
+  );
+});
+
+
+test("pins DNS names and rejects rebinding onto link-local, metadata, or unspecified addresses", async () => {
+  let called = false;
+  await assertPinnedHost("10.0.0.5", async () => {
+    called = true;
+    return ["127.0.0.1"];
+  });
+  assert.equal(called, false);
+  await assertPinnedHost("127.0.0.1", async () => {
+    throw new Error("should not resolve a literal");
+  });
+
+  await assertPinnedHost("example.com", async () => ["93.184.216.34"]);
+  await assertPinnedHost("localhost", async () => ["127.0.0.1", "::1"]);
+
+  for (const answers of [
+    ["169.254.169.254"],
+    ["0.0.0.0"],
+    ["::"],
+    ["fe80::1"],
+    ["100.100.100.200"],
+    ["93.184.216.34", "169.254.169.254"],
+    ["::ffff:169.254.169.254"],
+  ]) {
+    await assert.rejects(() => assertPinnedHost("rebind.example", async () => answers), PolicyError);
+  }
+
+  await assert.rejects(() => assertPinnedHost("intranet", async () => ["10.1.1.1"]), /pinnable DNS name/);
+  await assert.rejects(() => assertPinnedHost("bad_host.example", async () => ["10.1.1.1"]), /pinnable DNS name/);
+  await assert.rejects(
+    () =>
+      assertPinnedHost("missing.example", async () => {
+        throw new Error("ENOTFOUND missing.example");
+      }),
+    /could not be resolved/,
   );
 });

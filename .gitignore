@@ -15,3 +15,6 @@ cookies.txt
 **/Network Persistent State
 
 chrome-profile/
+confirm.port
+profile.vault
+*.vault

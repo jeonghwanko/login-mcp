@@ -1,3 +1,6 @@
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+
 const HTTP_PROTOCOLS = new Set(["http:", "https:"]);
 
 const TYPE_PASSWORD = /type\s*=\s*["']?password\b/i;
@@ -286,4 +289,79 @@ export function scrubPublicText(input: string, secrets: readonly string[] = []):
   });
   const line = (text.split("\n")[0] ?? text).replace(/[\r\n]/g, " ");
   return line.slice(0, 300);
+}
+
+
+const DNS_LABEL = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
+
+export type HostResolver = (hostname: string) => Promise<readonly string[]>;
+
+export function hostLabel(hostname: string): string {
+  let host = hostname.toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  if (host.endsWith(".")) host = host.slice(0, -1);
+  return host;
+}
+
+/** Names we will look up and reject if any answer is link-local, metadata, or unspecified. */
+export function isPinnableDnsName(hostname: string): boolean {
+  const host = hostLabel(hostname);
+  if (host === "localhost") return true;
+  if (host.length === 0 || host.length > 253 || !host.includes(".")) return false;
+  return host.split(".").every((label) => DNS_LABEL.test(label));
+}
+
+export function assertResolvedAddress(address: string): void {
+  const trimmed = address.trim().toLowerCase();
+  if (isIP(trimmed) === 0) throw new PolicyError(BLOCKED_HOST);
+  const literal = trimmed.includes(":") ? `http://[${trimmed}]/` : `http://${trimmed}/`;
+  parseHttpUrl(literal);
+}
+
+/**
+ * IP literals are checked directly. DNS names must resolve, and every answer
+ * must be a pinned-safe address. One link-local, metadata, or unspecified
+ * answer rejects the host (DNS rebinding).
+ */
+export async function assertPinnedHost(hostname: string, resolve: HostResolver): Promise<void> {
+  const host = hostLabel(hostname);
+  if (isIP(host) !== 0) {
+    assertResolvedAddress(host);
+    return;
+  }
+  if (!isPinnableDnsName(host)) {
+    throw new PolicyError("Refusing a host that is not a pinnable DNS name.");
+  }
+  let answers: readonly string[];
+  try {
+    answers = await resolve(host);
+  } catch {
+    throw new PolicyError("Refusing a host that could not be resolved and pinned.");
+  }
+  if (answers.length === 0) {
+    throw new PolicyError("Refusing a host that could not be resolved and pinned.");
+  }
+  for (const answer of answers) {
+    try {
+      assertResolvedAddress(answer);
+    } catch {
+      throw new PolicyError(
+        "Refusing a host that resolves to a link-local, metadata, or unspecified address.",
+      );
+    }
+  }
+}
+
+export async function defaultResolveHost(hostname: string): Promise<string[]> {
+  const records = await lookup(hostLabel(hostname), { all: true, verbatim: true });
+  return records.map((record) => record.address);
+}
+
+export async function screenHttpUrl(
+  input: string,
+  resolve: HostResolver = defaultResolveHost,
+): Promise<URL> {
+  const url = parseHttpUrl(input);
+  await assertPinnedHost(url.hostname, resolve);
+  return url;
 }
