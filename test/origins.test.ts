@@ -59,3 +59,54 @@ test("invalid origin is not written", async () => {
   await assert.rejects(() => store.confirm("https://example.com/path"));
   await assert.rejects(() => fs.stat(file));
 });
+
+test("origins file is private and parallel confirms are not lost", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "login-mcp-"));
+  const file = path.join(dir, "origins.json");
+  const store = createFileStore(file);
+  await Promise.all([
+    store.confirm("https://a.example"),
+    store.confirm("https://b.example"),
+    store.confirm("https://c.example"),
+  ]);
+  assert.deepEqual(await store.list(), ["https://a.example", "https://b.example", "https://c.example"]);
+  const st = await fs.stat(file);
+  assert.equal(st.mode & 0o077, 0);
+});
+
+test("confirm replaces a symlinked origins file instead of writing through it", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "login-mcp-"));
+  const outside = path.join(dir, "outside.json");
+  await fs.writeFile(outside, JSON.stringify({ origins: ["https://bank.example"] }));
+  const file = path.join(dir, "origins.json");
+  await fs.symlink(outside, file);
+  const store = createFileStore(file);
+  await assert.rejects(() => store.list(), /symlink/);
+  await store.confirm("https://a.example");
+  assert.equal(await fs.readFile(outside, "utf8"), JSON.stringify({ origins: ["https://bank.example"] }));
+  const st = await fs.lstat(file);
+  assert.equal(st.isSymbolicLink(), false);
+  assert.match(await fs.readFile(file, "utf8"), /a\.example/);
+  assert.equal((await fs.readFile(file, "utf8")).includes("bank"), false);
+});
+
+test("refuses an oversized origins file", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "login-mcp-"));
+  const file = path.join(dir, "origins.json");
+  await fs.writeFile(file, "x".repeat(300 * 1024));
+  const store = createFileStore(file);
+  await assert.rejects(() => store.list(), /too large/);
+});
+
+test("config refuses the system Chrome profile", () => {
+  assert.throws(
+    () =>
+      getConfig(
+        {
+          LOGIN_MCP_USER_DATA_DIR: path.join(os.homedir(), ".config", "google-chrome"),
+        },
+        "/work",
+      ),
+    /system Chrome profile/,
+  );
+});

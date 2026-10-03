@@ -3,10 +3,14 @@ import test from "node:test";
 import {
   PolicyError,
   assertOrigin,
+  elementIsChallenge,
+  elementIsPassword,
   looksLikeChallengeWidget,
   looksLikeLoginOrChallenge,
   looksLikePasswordField,
   parseHttpUrl,
+  redactUrl,
+  scrubPublicText,
 } from "../src/policy.ts";
 
 test("accepts http(s) origins and rejects paths, credentials, and other schemes", () => {
@@ -91,4 +95,105 @@ test("detects login pages and challenge widgets without treating ordinary pages 
   );
   assert.equal(looksLikeChallengeWidget("iframe[title='reCAPTCHA']"), true);
   assert.equal(looksLikeChallengeWidget("button.save"), false);
+});
+
+test("refuses link-local and metadata hosts, including normalized address forms", () => {
+  for (const bad of [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://2852039166/",
+    "http://0xA9.0xFE.0xA9.0xFE/",
+    "http://[::ffff:169.254.169.254]/",
+    "http://[fe80::1]/",
+    "http://[::]/",
+    "http://0.0.0.0/",
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://100.100.100.200/",
+    "http://[fd00:ec2::254]/",
+  ]) {
+    assert.throws(() => parseHttpUrl(bad), PolicyError);
+    assert.throws(() => assertOrigin(new URL(bad).origin), PolicyError);
+  }
+  assert.equal(parseHttpUrl("http://127.0.0.1:3000/").origin, "http://127.0.0.1:3000");
+  assert.equal(assertOrigin("http://localhost:3000"), "http://localhost:3000");
+  assert.equal(parseHttpUrl("http://10.0.0.5/").origin, "http://10.0.0.5");
+  assert.equal(parseHttpUrl("http://[::1]/").origin, "http://[::1]");
+});
+
+test("redacts credential query values and fragments, not ordinary query keys", () => {
+  const redacted = redactUrl("https://user:secret@example.com/cb?code=secret-token&tab=1#access_token=zzz");
+  assert.equal(redacted.includes("secret-token"), false);
+  assert.equal(redacted.includes("user:secret"), false);
+  assert.equal(redacted.includes("access_token"), false);
+  assert.match(redacted, /tab=1/);
+  assert.equal(redactUrl("https://example.com/dashboard"), "https://example.com/dashboard");
+});
+
+test("scrubbed errors keep the failure and drop urls and typed secrets", () => {
+  const text = scrubPublicText(
+    'page.goto: Timeout 20000ms exceeded.\nnavigating to "https://example.com/cb?code=secret-token"',
+    ["super-secret-value"],
+  );
+  assert.equal(text.includes("secret-token"), false);
+  assert.equal(text.includes("super-secret-value"), false);
+  assert.match(text, /Timeout/);
+  assert.equal(text.includes("\n"), false);
+});
+
+test("element facts catch password and challenge nodes selectors can hide", () => {
+  assert.equal(
+    elementIsPassword({
+      tag: "input",
+      type: "password",
+      autocomplete: null,
+      name: "q",
+      id: null,
+      className: null,
+      src: null,
+      title: null,
+      role: null,
+    }),
+    true,
+  );
+  assert.equal(
+    elementIsPassword({
+      tag: "input",
+      type: "text",
+      autocomplete: "current-password",
+      name: "x",
+      id: null,
+      className: null,
+      src: null,
+      title: null,
+      role: null,
+    }),
+    true,
+  );
+  assert.equal(
+    elementIsChallenge({
+      tag: "iframe",
+      type: null,
+      autocomplete: null,
+      name: null,
+      id: "widget",
+      className: null,
+      src: "https://challenges.cloudflare.com/turnstile/v0",
+      title: null,
+      role: null,
+    }),
+    true,
+  );
+  assert.equal(
+    elementIsPassword({
+      tag: "button",
+      type: "submit",
+      autocomplete: null,
+      name: "go",
+      id: null,
+      className: "primary",
+      src: null,
+      title: null,
+      role: null,
+    }),
+    false,
+  );
 });

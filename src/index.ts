@@ -8,7 +8,7 @@ import { createFileStore } from "./origins.js";
 import { createService, type ToolText } from "./service.js";
 
 const INSTRUCTIONS =
-  "Reuse a human-completed Chrome login. Never type, store, or request passwords. Never export cookies or storage. If a tool returns human_action_required, stop and let the human finish in the open Chrome window. Do not solve CAPTCHA, 2FA, or bot checks.";
+  "Reuse a human-completed Chrome login. Never type, store, or request passwords. Never export cookies or storage. If a tool returns human_action_required, stop and let the human finish in the open Chrome window. Do not solve CAPTCHA, 2FA, or bot checks. If a navigation is refused because it left the confirmed origins, do not retry it or ask for the page text.";
 
 function toContent(result: ToolText) {
   return {
@@ -116,8 +116,16 @@ async function main(): Promise<void> {
     void browser.close();
   };
 
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const timer = setTimeout(() => {
+      console.error("[login-mcp] shutdown timed out");
+      process.exit(1);
+    }, 5000);
     void browser.close().finally(() => {
+      clearTimeout(timer);
       process.exit(0);
     });
   };

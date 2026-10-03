@@ -34,11 +34,39 @@ const LOGIN_TEXT = [
   "enter your password",
 ];
 
+const METADATA_HOSTS = new Set([
+  "metadata.google.internal",
+  "metadata.goog",
+  "instance-data",
+  "instance-data.ec2.internal",
+]);
+
+/** Query names whose values are credentials or login codes. */
+const SENSITIVE_QUERY =
+  /(?:^|[._-])(?:access|refresh|id|auth|session|api|client)?[._-]?(?:token|password|passwd|secret|session|jwt|otp|sid|code|ticket|assertion|credential)(?:$|[._-])/i;
+
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g;
+const URL_IN_TEXT = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+
+const BLOCKED_HOST = "Refusing a link-local, unspecified, or cloud-metadata host.";
+
 export class PolicyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PolicyError";
   }
+}
+
+export interface ElementFacts {
+  tag: string;
+  type: string | null;
+  autocomplete: string | null;
+  name: string | null;
+  id: string | null;
+  className: string | null;
+  src: string | null;
+  title: string | null;
+  role: string | null;
 }
 
 export function parseHttpUrl(input: string): URL {
@@ -54,6 +82,7 @@ export function parseHttpUrl(input: string): URL {
   if (url.username || url.password) {
     throw new PolicyError("URLs must not contain credentials.");
   }
+  assertAllowedHost(url);
   return url;
 }
 
@@ -71,6 +100,7 @@ export function assertOrigin(input: string): string {
   if (url.username || url.password) {
     throw new PolicyError("Origin must not contain credentials.");
   }
+  assertAllowedHost(url);
   if (trimmed !== url.origin) {
     throw new PolicyError(
       `Origin must be exactly the origin, with no path, query, or hash. Expected ${url.origin}.`,
@@ -81,6 +111,90 @@ export function assertOrigin(input: string): string {
 
 export function originOfUrl(input: string): string {
   return parseHttpUrl(input).origin;
+}
+
+function assertAllowedHost(url: URL): void {
+  const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  if (
+    METADATA_HOSTS.has(host) ||
+    host.endsWith(".metadata.google.internal") ||
+    host.endsWith(".metadata.goog")
+  ) {
+    throw new PolicyError(BLOCKED_HOST);
+  }
+  if (isBlockedAddress(host)) {
+    throw new PolicyError(BLOCKED_HOST);
+  }
+}
+
+function isBlockedAddress(host: string): boolean {
+  const v4 = parseIPv4(host);
+  if (v4) return isBlockedIPv4(v4);
+  const hextets = parseIPv6(host);
+  if (!hextets) return false;
+  if (hextets.every((part) => part === 0)) return true;
+  const first = hextets[0] ?? 0;
+  if ((first & 0xffc0) === 0xfe80) return true;
+  if (
+    hextets[0] === 0xfd00 &&
+    hextets[1] === 0x0ec2 &&
+    hextets[2] === 0 &&
+    hextets[3] === 0 &&
+    hextets[4] === 0 &&
+    hextets[5] === 0 &&
+    hextets[6] === 0 &&
+    hextets[7] === 0x0254
+  ) {
+    return true;
+  }
+  if (hextets.slice(0, 5).every((part) => part === 0) && hextets[5] === 0xffff) {
+    const hi = hextets[6] ?? 0;
+    const lo = hextets[7] ?? 0;
+    return isBlockedIPv4([(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255]);
+  }
+  return false;
+}
+
+function isBlockedIPv4(parts: number[]): boolean {
+  const a = parts[0] ?? 0;
+  const b = parts[1] ?? 0;
+  const c = parts[2] ?? 0;
+  const d = parts[3] ?? 0;
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 100 && b === 100 && c === 100 && d === 200) return true;
+  return false;
+}
+
+function parseIPv4(host: string): number[] | null {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!match) return null;
+  const parts = match.slice(1).map((part) => Number(part));
+  if (parts.some((part) => !Number.isInteger(part) || part > 255)) return null;
+  return parts;
+}
+
+function parseIPv6(host: string): number[] | null {
+  if (host.includes(".")) return null;
+  const halves = host.split("::");
+  if (halves.length > 2) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (side.length === 0) return [];
+    const out: number[] = [];
+    for (const bit of side.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/i.test(bit)) return null;
+      out.push(parseInt(bit, 16));
+    }
+    return out;
+  };
+  const left = parseSide(halves[0] ?? "");
+  if (!left) return null;
+  if (halves.length === 1) return left.length === 8 ? left : null;
+  const right = parseSide(halves[1] ?? "");
+  if (!right) return null;
+  const missing = 8 - left.length - right.length;
+  if (missing < 0) return null;
+  return [...left, ...Array<number>(missing).fill(0), ...right];
 }
 
 function isPasswordDescriptor(value: string): boolean {
@@ -106,6 +220,26 @@ export function looksLikeChallengeWidget(selector: string, value?: string): bool
   return false;
 }
 
+function hasPasswordToken(value: string): boolean {
+  return /(?:^|[^a-z0-9])(?:password|passwd|passcode|pwd)(?:[^a-z0-9]|$)/i.test(value);
+}
+
+export function elementIsPassword(facts: ElementFacts): boolean {
+  const type = (facts.type ?? "").trim().toLowerCase();
+  if (type === "password") return true;
+  const autocomplete = (facts.autocomplete ?? "").toLowerCase();
+  if (autocomplete.includes("password")) return true;
+  if (hasPasswordToken(facts.name ?? "") || hasPasswordToken(facts.id ?? "")) return true;
+  return false;
+}
+
+export function elementIsChallenge(facts: ElementFacts): boolean {
+  const blob = [facts.id, facts.className, facts.src, facts.title, facts.name, facts.role]
+    .filter((part): part is string => Boolean(part))
+    .join(" ");
+  return CHALLENGE_WIDGET.test(blob);
+}
+
 export function looksLikeLoginOrChallenge(input: {
   url: string;
   hasPasswordInput: boolean;
@@ -117,4 +251,39 @@ export function looksLikeLoginOrChallenge(input: {
   if (LOGIN_TEXT.some((marker) => text.includes(marker))) return true;
   if (text.includes("just a moment") && text.includes("cloudflare")) return true;
   return false;
+}
+
+export function redactUrl(input: string): string {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    return "[invalid-url]";
+  }
+  url.username = "";
+  url.password = "";
+  url.hash = "";
+  for (const key of [...url.searchParams.keys()]) {
+    if (SENSITIVE_QUERY.test(key)) url.searchParams.set(key, "redacted");
+  }
+  return url.toString();
+}
+
+/** Drop secrets, credential URLs, and JWTs before a string is logged or returned. */
+export function scrubPublicText(input: string, secrets: readonly string[] = []): string {
+  let text = input;
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    text = text.split(secret).join("[redacted]");
+    const encoded = encodeURIComponent(secret);
+    if (encoded !== secret) text = text.split(encoded).join("[redacted]");
+  }
+  text = text.replace(JWT, "[redacted-jwt]");
+  text = text.replace(URL_IN_TEXT, (match) => {
+    const trimmed = match.replace(/[),.;]+$/g, "");
+    const suffix = match.slice(trimmed.length);
+    return redactUrl(trimmed) + suffix;
+  });
+  const line = (text.split("\n")[0] ?? text).replace(/[\r\n]/g, " ");
+  return line.slice(0, 300);
 }

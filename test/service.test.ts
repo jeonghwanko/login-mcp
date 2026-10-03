@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BrowserControl, PageSignals } from "../src/browser.ts";
+import type { BrowserControl, BrowserOps, PageSignals } from "../src/browser.ts";
 import type { OriginStore } from "../src/origins.ts";
 import { createService, type Status } from "../src/service.ts";
 
@@ -21,9 +21,9 @@ function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[
   };
 }
 
-function fakeBrowser(overrides: Partial<BrowserControl> = {}): BrowserControl & {
-  calls: string[];
-} {
+function fakeBrowser(
+  overrides: Partial<BrowserOps> & Partial<Pick<BrowserControl, "profileExists" | "isOpen" | "close">> = {},
+): BrowserControl & { calls: string[] } {
   const calls: string[] = [];
   const page: PageSignals = {
     title: "Dashboard",
@@ -31,10 +31,7 @@ function fakeBrowser(overrides: Partial<BrowserControl> = {}): BrowserControl & 
     hasPasswordInput: false,
     textSample: "Hello",
   };
-  const browser: BrowserControl & { calls: string[] } = {
-    calls,
-    profileExists: () => true,
-    isOpen: () => false,
+  const ops: BrowserOps = {
     async login(url: string) {
       calls.push(`login ${url}`);
     },
@@ -53,11 +50,25 @@ function fakeBrowser(overrides: Partial<BrowserControl> = {}): BrowserControl & 
     async act(action, selector) {
       calls.push(`act ${action} ${selector}`);
     },
-    async close() {
-      calls.push("close");
+    async blank() {
+      calls.push("blank");
     },
   };
-  return Object.assign(browser, overrides, { calls });
+  for (const key of ["login", "open", "inspect", "readText", "act", "blank"] as const) {
+    const override = overrides[key];
+    if (override) ops[key] = override as never;
+  }
+  return {
+    calls,
+    profileExists: overrides.profileExists ?? (() => true),
+    isOpen: overrides.isOpen ?? (() => false),
+    close: overrides.close ?? (async () => {
+      calls.push("close");
+    }),
+    exclusive(fn) {
+      return fn(ops);
+    },
+  };
 }
 
 test("status shape is profile, browser, and origins only", async () => {
@@ -191,4 +202,118 @@ test("confirmed open returns title, url, and a human-action flag", async () => {
   assert.equal(body.title, "Dashboard");
   assert.equal(body.url, "https://example.com/dashboard");
   assert.equal(body.human_action_required, false);
+});
+
+test("open and read drop cross-origin redirects without returning the other page", async () => {
+  const browser = fakeBrowser({
+    async open(url: string) {
+      browser.calls.push(`open ${url}`);
+      return {
+        title: "SECRET-TITLE",
+        url: "https://bank.example/account?code=secret-token#access_token=zzz",
+        hasPasswordInput: false,
+        textSample: "balance",
+      };
+    },
+    async readText() {
+      browser.calls.push("read");
+      return { text: "secret balance", truncated: false };
+    },
+  });
+  const service = createService({
+    store: memoryStore(["https://example.com"]),
+    browser,
+    log: () => undefined,
+  });
+  const opened = await service.open("https://example.com/go");
+  assert.equal(opened.isError, true);
+  assert.match(opened.text, /origin_not_confirmed/);
+  assert.match(opened.text, /bank\.example/);
+  assert.equal(opened.text.includes("secret-token"), false);
+  assert.equal(opened.text.includes("SECRET-TITLE"), false);
+  assert.equal(opened.text.includes("account"), false);
+  const read = await service.read({ url: "https://example.com/go" });
+  assert.equal(read.isError, true);
+  assert.equal(read.text.includes("secret balance"), false);
+  assert.equal(read.text.includes("secret-token"), false);
+  assert.deepEqual(browser.calls, ["open https://example.com/go", "blank", "open https://example.com/go", "blank"]);
+});
+
+test("read does not return text from a login or challenge page", async () => {
+  const browser = fakeBrowser({
+    async open(url: string) {
+      browser.calls.push(`open ${url}`);
+      return {
+        title: "Sign in",
+        url: "https://example.com/login",
+        hasPasswordInput: true,
+        textSample: "Enter your password",
+      };
+    },
+    async readText() {
+      browser.calls.push("read");
+      return { text: "Enter your password hunter2", truncated: false };
+    },
+  });
+  const service = createService({
+    store: memoryStore(["https://example.com"]),
+    browser,
+    log: () => undefined,
+  });
+  const result = await service.read({ url: "https://example.com/login" });
+  assert.match(result.text, /human_action_required/);
+  assert.equal(result.text.includes("hunter2"), false);
+  assert.deepEqual(browser.calls, ["open https://example.com/login"]);
+});
+
+test("login refuses metadata hosts and does not echo the path", async () => {
+  const browser = fakeBrowser();
+  const service = createService({ store: memoryStore(), browser, log: () => undefined });
+  const rejected = await service.login("http://169.254.169.254/latest/meta-data/iam/secret");
+  assert.equal(rejected.isError, true);
+  assert.equal(rejected.text.includes("secret"), false);
+  assert.equal(rejected.text.includes("meta-data"), false);
+  assert.deepEqual(browser.calls, []);
+});
+
+test("fill errors do not return the typed value", async () => {
+  const browser = fakeBrowser({
+    async act() {
+      browser.calls.push("act");
+      throw new Error("cannot fill super-secret-value");
+    },
+  });
+  const service = createService({
+    store: memoryStore(["https://example.com"]),
+    browser,
+    log: () => undefined,
+  });
+  const result = await service.act({ action: "fill", selector: "input[name=q]", value: "super-secret-value" });
+  assert.equal(result.isError, true);
+  assert.equal(result.text.includes("super-secret-value"), false);
+});
+
+test("same-origin open redacts credential query values", async () => {
+  const browser = fakeBrowser({
+    async open(url: string) {
+      browser.calls.push(`open ${url}`);
+      return {
+        title: "Dashboard",
+        url: "https://example.com/cb?code=secret-token&tab=1#access_token=zzz",
+        hasPasswordInput: false,
+        textSample: "Hello",
+      };
+    },
+  });
+  const service = createService({
+    store: memoryStore(["https://example.com"]),
+    browser,
+    log: () => undefined,
+  });
+  const result = await service.open("https://example.com/cb");
+  assert.equal(result.isError, undefined);
+  const body = JSON.parse(result.text) as { url: string };
+  assert.equal(body.url.includes("secret-token"), false);
+  assert.equal(body.url.includes("access_token"), false);
+  assert.match(body.url, /tab=1/);
 });

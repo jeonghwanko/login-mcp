@@ -6,14 +6,14 @@ A person logs into a site once in a local Chrome window. Later, an agent calls M
 
 ## Security model
 
-- Passwords, tokens, and other credentials are not collected, typed, or written to disk by this server.
-- There is no tool that exports cookies, `localStorage`, or `sessionStorage`.
-- Login, CAPTCHA, 2FA, and bot checks are left to the human. If a page looks like a login or challenge, tools return `human_action_required` and stop. This server does not try to solve them.
-- There is no stealth mode and no fingerprint evasion. Chrome runs visibly with Playwright's normal settings and `channel: "chrome"`.
-- The session lives only in a Chrome user-data directory on this machine (`data/chrome-profile` by default). That directory contains session cookies. Treat it as a secret. It is gitignored. Do not copy it into a repo, a ticket, or a log.
-- Confirmed sites are stored as origins only (`https://example.com`) in `data/origins.json`, also gitignored.
-- `auth_act` refuses selectors that look like password fields (`type=password`, or `name` / `id` / `autocomplete` containing `password`) and refuses actions on origins the human has not confirmed.
-- Only `http` and `https` URLs are allowed. URLs with embedded usernames or passwords are rejected.
+- This server never asks for, types, or stores a password. It also never returns cookies, `localStorage`, `sessionStorage`, or Playwright `storageState`.
+- The session **is** the Chrome profile on disk (`data/chrome-profile` by default). Chrome writes session cookies there. That is equivalent to a password. It is not a separate encrypted vault: there is no passphrase, KDF, or ciphertext around the profile, because Chrome has to read those files to reuse the login. Treat the directory as a secret. It is gitignored. Do not copy it into a repo, a ticket, or a log.
+- The profile directory is created mode `0700` and must not be a symlink. The daily system Chrome profile (`~/.config/google-chrome` and the usual platform paths) is refused. Confirmed origins are stored only in `data/origins.json` (mode `0600`), written via a random temp file so a symlink cannot be followed.
+- One profile is shared by every site. Chrome still isolates cookies by origin. The agent may only open and read origins it has confirmed. A navigation that **redirects** off that allowlist is not read; the tab is sent to `about:blank` instead. Confirm both `https://example.com` and `https://www.example.com` if a site uses both.
+- Login, CAPTCHA, 2FA, and bot checks are left to the human. On a page that looks like a login or challenge, `auth_read` does not return page text. `auth_act` refuses password fields (selector text **and** the live element's `type` / `name` / `id` / `autocomplete`, including inside frames) and challenge widgets. This is not a bypass, and the heuristics are not perfect.
+- Link-local addresses, `0.0.0.0/8`, and well-known cloud metadata hosts are refused. `localhost` and ordinary private LAN hosts are allowed so you can sign in to a local app. Only `http` and `https` URLs are allowed. URLs with embedded usernames or passwords are rejected. Tool results strip URL userinfo and fragments, and redact query values whose names look like tokens or codes.
+- There is no stealth mode and no fingerprint evasion. Chrome runs visibly (`channel: "chrome"`) with the Chromium sandbox on, downloads disabled, and sync disabled. Launch and navigation have timeouts. Ctrl+C closes Chrome and exits even if shutdown hangs.
+- `auth_confirm` records an origin the agent supplies. It is an allowlist, not cryptographic proof that a human clicked something. Approve the tool in the MCP host if you want a human gate.
 
 This is for the account holder reusing their own session on their own computer. It is not a credential manager and it does not grant access the human does not already have.
 
@@ -72,7 +72,7 @@ Override these in tests or if you want the profile outside the repo. Never point
 
 ## Troubleshooting
 
-Chrome locks the user-data directory. If launch fails with a message that Chrome is already running with this profile, close every Chrome window using `data/chrome-profile` and call the tool again. Do not delete the profile if you want to keep the session.
+Chrome locks the user-data directory. If launch fails with a message that Chrome is already running with this profile, close every Chrome window using `data/chrome-profile` and call the tool again. Do not delete the profile if you want to keep the session. Do not point `LOGIN_MCP_USER_DATA_DIR` at your normal Chrome profile or at a symlink. If a confirmed site redirects to another origin, confirm that origin explicitly before expecting `auth_open` or `auth_read` to succeed.
 
 ## Development
 
