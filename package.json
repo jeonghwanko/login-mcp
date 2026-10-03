@@ -1,0 +1,32 @@
+{
+  "name": "login-mcp",
+  "version": "0.1.0",
+  "description": "Local Auth MCP that reuses a human-completed browser session. Never stores passwords.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeonghwanko/login-mcp.git"
+  },
+  "bin": {
+    "login-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test test/policy.test.ts test/origins.test.ts test/service.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "playwright-core": "^1.55.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
