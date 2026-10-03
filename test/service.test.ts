@@ -11,6 +11,7 @@ function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[
   const confirmed = [...initial];
   let session: "ok" | "needs_login" = "ok";
   let lastUsed: string | null = null;
+  let lastConfirmed: string | null = null;
   return {
     confirmed,
     get session() {
@@ -26,6 +27,7 @@ function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[
           loginOrigin,
           workOrigins: origins.filter((origin) => origin !== loginOrigin),
           lastUsed,
+          lastConfirmed,
           session,
         },
       ];
@@ -40,8 +42,9 @@ function memoryStore(initial: string[] = []): OriginStore & { confirmed: string[
       }
       return [...confirmed].sort();
     },
-    async touch(_site: string, _when?: Date, next?: "ok" | "needs_login") {
+    async touch(_site: string, _when?: Date, next?: "ok" | "needs_login", options?: { confirmed?: boolean }) {
       lastUsed = new Date().toISOString();
+      if (options?.confirmed) lastConfirmed = lastUsed;
       if (next === "ok" || next === "needs_login") session = next;
       return lastUsed;
     },
@@ -136,11 +139,22 @@ test("status shape has no cookie fields", async () => {
   assert.equal(status.sites.length, 1);
   assert.equal(status.lines.length, 1);
   const site = status.sites[0]!;
-  assert.deepEqual(Object.keys(site).sort(), ["lastUsed", "line", "origins", "profileExists", "session", "site"]);
+  assert.deepEqual(Object.keys(site).sort(), [
+    "lastConfirmed",
+    "lastUsed",
+    "line",
+    "origins",
+    "profileExists",
+    "session",
+    "sessionAgeMs",
+    "site",
+  ]);
   assert.equal(site.site, SITE);
   assert.deepEqual(site.origins, ["https://example.com"]);
   assert.equal(site.session, "ok");
-  assert.equal(site.line, "demo origins=https://example.com lastUsed=- session=ok");
+  assert.equal(site.line, "demo origins=https://example.com lastUsed=- lastConfirmed=- session=ok age=-");
+  assert.equal(site.lastConfirmed, null);
+  assert.equal(site.sessionAgeMs, null);
   assert.equal(status.lines[0], site.line);
   assert.equal(typeof site.profileExists, "boolean");
   walkNoSecrets(status);
@@ -496,7 +510,10 @@ test("status session is needs_login after a login page and the line has no query
   assert.equal(expired.text.includes("secret-token"), false);
   const needs = JSON.parse((await service.status()).text) as Status;
   assert.equal(needs.sites[0]?.session, "needs_login");
-  assert.match(needs.lines[0] ?? "", /^demo origins=https:\/\/example.com lastUsed=.+ session=needs_login$/);
+  assert.match(
+    needs.lines[0] ?? "",
+    /^demo origins=https:\/\/example.com lastUsed=.+ lastConfirmed=- session=needs_login age=\d+$/,
+  );
   assert.equal((needs.lines[0] ?? "").includes("secret-token"), false);
   assert.equal((needs.lines[0] ?? "").includes("?"), false);
   assert.equal((needs.lines[0] ?? "").toLowerCase().includes("cookie"), false);
@@ -505,7 +522,8 @@ test("status session is needs_login after a login page and the line has no query
   assert.equal(again.isError, undefined);
   const okStatus = JSON.parse((await service.status()).text) as Status;
   assert.equal(okStatus.sites[0]?.session, "ok");
-  assert.match(okStatus.lines[0] ?? "", /session=ok$/);
+  assert.match(okStatus.lines[0] ?? "", /session=ok age=\d+$/);
+  assert.equal(okStatus.sites[0]?.lastConfirmed, null);
 });
 
 test("open, read, and act re-resolve DNS pins and reject metadata answers", async () => {
@@ -570,6 +588,41 @@ test("open, read, and act re-resolve DNS pins and reject metadata answers", asyn
   assert.equal(foreign.text.includes("secret"), false);
   assert.equal(foreign.text.includes("meta-data"), false);
   assert.equal(browser.calls.length, callsBefore);
+});
+
+test("status keeps last confirmed beside needs_login and omits query secrets", async () => {
+  const store = memoryStore();
+  const service = serviceWith(store, fakeBrowser());
+  const confirmed = await service.confirm(SITE, "https://example.com");
+  assert.equal(confirmed.isError, undefined);
+  const status = JSON.parse((await service.status()).text) as Status;
+  const site = status.sites[0]!;
+  assert.equal(typeof site.lastConfirmed, "string");
+  assert.equal(site.lastUsed, site.lastConfirmed);
+  assert.equal(typeof site.sessionAgeMs, "number");
+  assert.match(site.line, /lastConfirmed=\d{4}-\d{2}-\d{2}T/);
+  assert.match(site.line, /session=ok age=\d+$/);
+  assert.equal(site.line.includes("?"), false);
+  const browser = fakeBrowser({
+    async open() {
+      return {
+        title: "Sign in",
+        url: "https://example.com/login?token=secret-token",
+        hasPasswordInput: true,
+        textSample: "Enter your password",
+      };
+    },
+  });
+  const again = serviceWith(store, browser);
+  const expired = await again.open(SITE, "https://example.com/login");
+  assert.match(expired.text, /human_action_required/);
+  assert.equal(expired.text.includes("secret-token"), false);
+  const needs = JSON.parse((await again.status()).text) as Status;
+  assert.equal(needs.sites[0]?.session, "needs_login");
+  assert.equal(needs.sites[0]?.lastConfirmed, site.lastConfirmed);
+  assert.match(needs.lines[0] ?? "", /session=needs_login age=\d+$/);
+  assert.equal((needs.lines[0] ?? "").includes("secret-token"), false);
+  assert.equal((needs.lines[0] ?? "").includes("?"), false);
 });
 
 function walkNoSecrets(value: unknown): void {

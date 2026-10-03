@@ -9,7 +9,7 @@ import { createFileStore } from "../src/origins.ts";
 import { writePrivateJson } from "../src/private-file.ts";
 import { createService } from "../src/service.ts";
 import { assertSiteId, resolveSitePaths } from "../src/site-path.ts";
-import { createProfileVault, relockClosedSite } from "../src/vault.ts";
+import { createProfileVault, relockClosedSite, sealLeftoverProfiles } from "../src/vault.ts";
 import { chromeLaunchArgs, type BrowserControl, type BrowserOps, type PageSignals } from "../src/browser.ts";
 
 const SENTINEL = "COOKIEVALUE-do-not-leak-7f3a9c";
@@ -273,4 +273,55 @@ test("relock helper encrypts on browser close, chmod-only without a key, and ski
   const rules = "MAP example.com 93.184.216.34";
   assert.deepEqual(chromeLaunchArgs(rules).at(-1), `--host-resolver-rules=${rules}`);
   assert.equal(chromeLaunchArgs("").some((arg) => arg.startsWith("--host-resolver-rules=")), false);
+});
+
+test("startup seal encrypts a plaintext leftover, chmods without a key, and does not touch a live chrome profile", () => {
+  const dir = tempDir();
+  const legacy = path.join(dir, "chrome-profile");
+  fs.mkdirSync(path.join(legacy, "Default"), { recursive: true, mode: 0o755 });
+  const legacyCookie = path.join(legacy, "Default", "Cookies");
+  fs.writeFileSync(legacyCookie, "legacy-" + SENTINEL, { mode: 0o644 });
+  fs.chmodSync(legacyCookie, 0o644);
+  fs.chmodSync(legacy, 0o755);
+  fs.symlinkSync(`box-${process.pid}`, path.join(legacy, "SingletonLock"));
+
+  const live = resolveSitePaths(dir, "live");
+  fs.mkdirSync(path.join(live.profile, "Default"), { recursive: true, mode: 0o755 });
+  const liveCookie = path.join(live.profile, "Default", "Cookies");
+  fs.writeFileSync(liveCookie, "live-" + SENTINEL, { mode: 0o644 });
+  fs.symlinkSync(`box-${process.pid}`, path.join(live.profile, "SingletonLock"));
+
+  const stale = resolveSitePaths(dir, "stale");
+  fs.mkdirSync(path.join(stale.profile, "Default"), { recursive: true, mode: 0o755 });
+  const staleCookie = path.join(stale.profile, "Default", "Cookies");
+  fs.writeFileSync(staleCookie, "stale-" + SENTINEL, { mode: 0o644 });
+  fs.symlinkSync("box-99999999", path.join(stale.profile, "SingletonLock"));
+
+  const plainDir = tempDir();
+  const plainPaths = resolveSitePaths(plainDir, "demo");
+  fs.mkdirSync(path.join(plainPaths.profile, "Default"), { recursive: true, mode: 0o755 });
+  const plainCookie = path.join(plainPaths.profile, "Default", "Cookies");
+  fs.writeFileSync(plainCookie, "plain-" + SENTINEL, { mode: 0o644 });
+
+  sealLeftoverProfiles(createProfileVault(null), plainDir);
+  assert.equal(fs.existsSync(plainPaths.profile), true);
+  assert.equal(fs.existsSync(plainPaths.vault), false);
+  assert.equal(fs.statSync(plainPaths.profile).mode & 0o077, 0);
+  assert.equal(fs.statSync(plainCookie).mode & 0o077, 0);
+  assert.equal(fs.readFileSync(plainCookie, "utf8"), "plain-" + SENTINEL);
+
+  sealLeftoverProfiles(createProfileVault(KEY), dir);
+  assert.equal(fs.readFileSync(legacyCookie, "utf8"), "legacy-" + SENTINEL);
+  assert.equal(fs.statSync(legacy).mode & 0o777, 0o755);
+  assert.equal(fs.statSync(legacyCookie).mode & 0o777, 0o644);
+  assert.equal(fs.existsSync(liveCookie), true);
+  assert.equal(fs.readFileSync(liveCookie, "utf8"), "live-" + SENTINEL);
+  assert.equal(fs.existsSync(live.vault), false);
+  assert.equal(fs.existsSync(stale.profile), false);
+  assert.equal(fs.existsSync(stale.vault), true);
+  const blob = fs.readFileSync(stale.vault);
+  assert.equal(blob.includes(Buffer.from("stale-" + SENTINEL)), false);
+  assert.equal(blob.includes(Buffer.from(KEY)), false);
+  createProfileVault(KEY).unlockSite(dir, "stale");
+  assert.equal(fs.readFileSync(path.join(stale.profile, "Default", "Cookies"), "utf8"), "stale-" + SENTINEL);
 });

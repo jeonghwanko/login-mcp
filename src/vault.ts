@@ -106,6 +106,67 @@ export function relockClosedSite(
   vault.lockSite(dataDir, site);
 }
 
+/**
+ * True when Chrome's SingletonLock names a process that is still running.
+ * A stale lock (SIGKILL leftover) is not in use. This never signals the process.
+ */
+export function chromeProfileInUse(profileDir: string): boolean {
+  const lockPath = path.join(profileDir, "SingletonLock");
+  let target: string;
+  try {
+    const st = fs.lstatSync(lockPath);
+    if (!st.isSymbolicLink()) return false;
+    target = fs.readlinkSync(lockPath);
+  } catch {
+    return false;
+  }
+  const match = /-(\d+)$/.exec(target);
+  if (!match) return false;
+  const pid = Number(match[1]);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
+/** The legacy shared profile is never sealed, chmod'd, or removed. */
+export function isLegacySharedProfile(dataDir: string, candidate: string): boolean {
+  const legacy = path.resolve(dataDir, "chrome-profile");
+  const resolved = path.resolve(candidate);
+  return resolved === legacy || resolved.startsWith(legacy + path.sep);
+}
+
+/**
+ * Encrypt plaintext site profiles left behind after SIGKILL, before anything else
+ * opens them. With no key, only mode 0700/0600 is applied. Sessions are not deleted.
+ * A live Chrome lock is skipped. data/chrome-profile is never touched.
+ */
+export function sealLeftoverProfiles(
+  vault: { lockSite(dataDir: string, site: string): void },
+  dataDir: string,
+): void {
+  for (const id of listSiteIds(dataDir)) {
+    try {
+      const paths = resolveSitePaths(dataDir, id);
+      if (isLegacySharedProfile(dataDir, paths.profile) || isLegacySharedProfile(dataDir, paths.root)) {
+        continue;
+      }
+      if (!fs.existsSync(paths.profile)) continue;
+      const st = fs.lstatSync(paths.profile);
+      if (st.isSymbolicLink() || !st.isDirectory()) continue;
+      if (chromeProfileInUse(paths.profile)) continue;
+      vault.lockSite(dataDir, id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[login-mcp] profile seal failed site=${id} ${message.split("\n")[0]?.slice(0, 200)}`);
+    }
+  }
+}
+
 function isRegularFile(file: string): boolean {
   try {
     const st = fs.lstatSync(file);

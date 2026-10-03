@@ -82,6 +82,7 @@ test("origins file is private and parallel confirms are not lost", async () => {
   assert.equal(record.site, "demo");
   assert.deepEqual(record.origins, ["https://a.example", "https://b.example", "https://c.example"]);
   assert.equal(record.lastUsed, null);
+  assert.equal(record.lastConfirmed, null);
   assert.equal(record.session, "ok");
   assert.ok(record.loginOrigin);
   assert.equal(record.origins.includes(record.loginOrigin), true);
@@ -150,9 +151,19 @@ test("meta stores session without cookies or query secrets", async () => {
   assert.deepEqual(listed[0]?.workOrigins, ["https://www.example"]);
   assert.equal(listed[0]?.session, "needs_login");
   assert.equal(listed[0]?.lastUsed, "2026-10-03T00:00:00.000Z");
+  assert.equal(listed[0]?.lastConfirmed, null);
   const meta = await fs.readFile(path.join(dir, "sites", "demo", "meta.json"), "utf8");
   assert.equal(meta.includes("cookie"), false);
   assert.equal(meta.includes("?"), false);
   await store.touch("demo", new Date("2026-10-03T01:00:00.000Z"));
   assert.equal((await store.list())[0]?.session, "needs_login");
+  assert.equal((await store.list())[0]?.lastConfirmed, null);
+  await store.touch("demo", new Date("2026-10-03T02:00:00.000Z"), "ok", { confirmed: true });
+  const confirmed = (await store.list())[0];
+  assert.equal(confirmed?.session, "ok");
+  assert.equal(confirmed?.lastConfirmed, "2026-10-03T02:00:00.000Z");
+  assert.equal(confirmed?.lastUsed, "2026-10-03T02:00:00.000Z");
+  const again = await fs.readFile(path.join(dir, "sites", "demo", "meta.json"), "utf8");
+  assert.equal(again.includes("cookie"), false);
+  assert.equal(again.includes("?"), false);
 });

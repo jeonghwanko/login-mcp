@@ -1,4 +1,4 @@
-import { lookup } from "node:dns/promises";
+import { lookup, resolve4, resolve6 } from "node:dns/promises";
 import { isIP } from "node:net";
 
 const HTTP_PROTOCOLS = new Set(["http:", "https:"]);
@@ -127,6 +127,27 @@ function assertAllowedHost(url: URL): void {
   }
   if (isBlockedAddress(host)) {
     throw new PolicyError(BLOCKED_HOST);
+  }
+}
+
+/**
+ * Block a request whose host is link-local, metadata, or unspecified.
+ * Ordinary third-party hosts (CDN, fonts, IdP) are not blocked here.
+ * This does not try to pin the public internet.
+ */
+export function requestTargetsBlockedHost(input: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    return false;
+  }
+  if (!HTTP_PROTOCOLS.has(url.protocol)) return false;
+  try {
+    assertAllowedHost(url);
+    return false;
+  } catch (error) {
+    return error instanceof PolicyError;
   }
 }
 
@@ -358,7 +379,7 @@ export async function resolvePinnedHost(
         "Refusing a host that resolves to a link-local, metadata, or unspecified address.",
       );
     }
-    checked.push(answer.trim().toLowerCase());
+    checked.push(canonicalIp(answer));
   }
   return checked;
 }
@@ -368,9 +389,13 @@ export async function assertPinnedHost(hostname: string, resolve: HostResolver):
 }
 
 /**
- * Chromium --host-resolver-rules value. MAP accepts one replacement, so each
- * DNS name is pinned to one checked address (lowest IPv4, else lowest IPv6).
- * Every address is rejected first if it is link-local, metadata, or unspecified.
+ * Chromium --host-resolver-rules MAP accepts a single replacement address.
+ * Every checked A/AAAA (or the literal) is kept on the pin. The MAP target is
+ * one member of that set (lowest IPv4, else lowest IPv6), never an address
+ * outside the set and never a link-local, metadata, or unspecified address.
+ * Callers must also fail closed when a connected address is observed outside
+ * the set, and when several addresses were resolved but the connected address
+ * cannot be checked. Other checked addresses are not dropped.
  * IPv6 replacements are bracketed so the last colon is not parsed as a port.
  */
 export function hostResolverRules(pins: readonly HostPin[]): string {
@@ -389,26 +414,146 @@ export function hostResolverRules(pins: readonly HostPin[]): string {
     if (pin.addresses.length === 0) {
       throw new PolicyError("Refusing a host that could not be resolved and pinned.");
     }
-    const checked: string[] = [];
-    for (const address of pin.addresses) {
-      assertResolvedAddress(address);
-      checked.push(address.trim().toLowerCase());
-    }
-    const chosen = choosePinAddress(checked);
+    const checked = checkedAddresses(pin.addresses);
+    const chosen = mappedPinAddress(checked);
+    assertAddressInResolvedSet(chosen, checked);
     rules.push(`MAP ${pin.hostname} ${formatResolverAddress(chosen)}`);
   }
   return rules.join(", ");
 }
 
-function choosePinAddress(addresses: readonly string[]): string {
-  const unique = [...new Set(addresses)];
+/** The single MAP replacement. It is always a member of the checked set. */
+export function mappedPinAddress(addresses: readonly string[]): string {
+  const unique = [...new Set(checkedAddresses(addresses))];
   const v4 = unique.filter((address) => isIP(address) === 4).sort(compareIPv4);
   if (v4.length > 0) return v4[0]!;
-  const v6 = unique.filter((address) => isIP(address) === 6).sort();
+  const v6 = unique.filter((address) => isIP(address) === 6).sort(compareIPv6);
   if (v6.length === 0) {
     throw new PolicyError("Refusing a host that could not be resolved and pinned.");
   }
   return v6[0]!;
+}
+
+/** Fail closed unless `address` is one of the resolved, already-checked addresses. */
+export function assertAddressInResolvedSet(address: string, resolved: readonly string[]): void {
+  const canon = canonicalIp(address);
+  const allowed = new Set(resolved.map((item) => canonicalIp(item)));
+  if (!allowed.has(canon)) {
+    throw new PolicyError("Refusing to pin an address that is not in the resolved set.");
+  }
+}
+
+/**
+ * Fail closed when the connected address is outside the resolved set.
+ * A missing observation fails closed when more than one public answer exists,
+ * because MAP alone cannot name every address.
+ */
+export function assertObservedPeer(resolved: readonly string[], remote: string | null): void {
+  const unique = [...new Set(checkedAddresses(resolved))];
+  if (unique.length === 0) {
+    throw new PolicyError("Refusing a host that could not be resolved and pinned.");
+  }
+  if (remote === null || remote.trim().length === 0) {
+    if (unique.length > 1) {
+      throw new PolicyError(
+        "Refusing to continue: multiple addresses were resolved and the connected address could not be checked.",
+      );
+    }
+    return;
+  }
+  assertAddressInResolvedSet(remote, unique);
+}
+
+/**
+ * Document connections to a pinned DNS name must land in that name's full
+ * checked set. Hosts we did not pin are ignored here so a CDN is not treated
+ * as part of the pin. IP literals must match themselves.
+ */
+export function assertNavigationPeer(
+  pins: readonly HostPin[],
+  pageUrl: string,
+  remote: string | null,
+): void {
+  let url: URL;
+  try {
+    url = parseHttpUrl(pageUrl);
+  } catch {
+    return;
+  }
+  const host = hostLabel(url.hostname);
+  if (isIP(host) !== 0) {
+    assertResolvedAddress(host);
+    if (remote !== null && remote.trim().length > 0 && canonicalIp(remote) !== canonicalIp(host)) {
+      throw new PolicyError("Refusing a connection to an address that is not the pinned literal.");
+    }
+    return;
+  }
+  const pin = pins.find((item) => hostLabel(item.hostname) === host);
+  if (!pin) return;
+  assertObservedPeer(pin.addresses, remote);
+}
+
+function checkedAddresses(addresses: readonly string[]): string[] {
+  const checked: string[] = [];
+  for (const address of addresses) {
+    assertResolvedAddress(address);
+    const canon = canonicalIp(address);
+    if (!checked.includes(canon)) checked.push(canon);
+  }
+  return checked;
+}
+
+export function canonicalIp(address: string): string {
+  const raw = address.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const v4 = parseIPv4(raw);
+  if (v4) return v4.join(".");
+  const v6 = parseIPv6(raw.includes(".") ? expandMappedIpv6(raw) ?? "" : raw);
+  if (!v6) return raw;
+  return compressIPv6(v6);
+}
+
+function expandMappedIpv6(host: string): string | null {
+  const match = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
+  if (!match) return null;
+  const v4 = parseIPv4(match[2] ?? "");
+  if (!v4) return null;
+  const hi = ((v4[0] ?? 0) << 8) | (v4[1] ?? 0);
+  const lo = ((v4[2] ?? 0) << 8) | (v4[3] ?? 0);
+  return `${match[1]}${hi.toString(16)}:${lo.toString(16)}`;
+}
+
+function compressIPv6(parts: readonly number[]): string {
+  let bestStart = -1;
+  let bestLen = 0;
+  let index = 0;
+  while (index < 8) {
+    if (parts[index] !== 0) {
+      index += 1;
+      continue;
+    }
+    let end = index;
+    while (end < 8 && parts[end] === 0) end += 1;
+    if (end - index > bestLen) {
+      bestStart = index;
+      bestLen = end - index;
+    }
+    index = end;
+  }
+  if (bestLen < 2) bestStart = -1;
+  const out: string[] = [];
+  for (let cursor = 0; cursor < 8; ) {
+    if (cursor === bestStart) {
+      out.push("");
+      cursor += bestLen;
+      continue;
+    }
+    out.push((parts[cursor] ?? 0).toString(16));
+    cursor += 1;
+  }
+  let text = out.join(":");
+  if (text.startsWith(":")) text = `:${text}`;
+  if (text.endsWith(":")) text = `${text}:`;
+  return text.length === 0 ? "::" : text;
 }
 
 function compareIPv4(a: string, b: string): number {
@@ -421,14 +566,53 @@ function compareIPv4(a: string, b: string): number {
   return 0;
 }
 
+function compareIPv6(a: string, b: string): number {
+  const left = parseIPv6(a) ?? [];
+  const right = parseIPv6(b) ?? [];
+  for (let i = 0; i < 8; i += 1) {
+    const diff = (left[i] ?? 0) - (right[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 function formatResolverAddress(address: string): string {
   if (address.includes(":")) return `[${address.replace(/^\[|\]$/g, "")}]`;
   return address;
 }
 
+/**
+ * Record every A and AAAA answer, plus getaddrinfo results (localhost, hosts file).
+ * Callers reject the whole host if any answer is link-local, metadata, or unspecified.
+ */
 export async function defaultResolveHost(hostname: string): Promise<string[]> {
-  const records = await lookup(hostLabel(hostname), { all: true, verbatim: true });
-  return records.map((record) => record.address);
+  const host = hostLabel(hostname);
+  const found: string[] = [];
+  const add = (list: readonly string[]) => {
+    for (const item of list) {
+      const address = canonicalIp(item);
+      if (address.length === 0 || found.includes(address)) continue;
+      found.push(address);
+    }
+  };
+  const errors: unknown[] = [];
+  const collect = async (load: () => Promise<readonly string[]>) => {
+    try {
+      add(await load());
+    } catch (error) {
+      errors.push(error);
+    }
+  };
+  await Promise.all([
+    collect(async () => resolve4(host)),
+    collect(async () => resolve6(host)),
+    collect(async () => (await lookup(host, { all: true, verbatim: true })).map((record) => record.address)),
+  ]);
+  if (found.length === 0) {
+    const first = errors[0];
+    throw first instanceof Error ? first : new Error(`ENOTFOUND ${host}`);
+  }
+  return found;
 }
 
 export async function screenHttpUrl(

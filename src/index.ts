@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createChromeBrowser } from "./browser.js";
+import { createProfileVault, sealLeftoverProfiles } from "./vault.js";
 import { getConfig } from "./config.js";
 import { confirmFromTerminal, createHumanSignals } from "./human-signal.js";
 import { createFileStore } from "./origins.js";
@@ -54,9 +55,10 @@ async function main(): Promise<void> {
   }
   if (!config.encryptionKey) {
     console.error(
-      "[login-mcp] LOGIN_MCP_KEY is unset. Profiles stay mode 0700/0600. Set LOGIN_MCP_KEY to encrypt a profile when its browser closes. SIGKILL cannot run that hook.",
+      "[login-mcp] LOGIN_MCP_KEY is unset. Profiles stay mode 0700/0600. Set LOGIN_MCP_KEY to encrypt a profile when its browser closes. SIGKILL cannot run that hook; the next start seals a leftover plaintext profile.",
     );
   }
+  sealLeftoverProfiles(createProfileVault(config.encryptionKey), config.dataDir);
   const browser = createChromeBrowser({
     dataDir: config.dataDir,
     encryptionKey: config.encryptionKey,
@@ -79,7 +81,7 @@ async function main(): Promise<void> {
     "auth_status",
     {
       description:
-        "One line per site: site id, confirmed login and work origins, last used time, and session ok or needs_login. needs_login means the last open saw a login page. Returns no cookies, tokens, or URL query secrets.",
+        "One line per site: site id, confirmed login and work origins, last used time, last confirmed time, session age, and session ok or needs_login. needs_login means the last open saw a login page. Age makes a stale ok visible. Returns no cookies, tokens, or URL query secrets.",
       inputSchema: {
         site: siteField.optional().describe("Optional site id. Omit to list every site."),
       },
@@ -122,7 +124,7 @@ async function main(): Promise<void> {
     "auth_open",
     {
       description:
-        "Open a URL in that site's Chrome profile. The origin must already be human-confirmed for the site (login origin or a work origin). Re-resolves DNS and pins Chrome to the checked addresses. Returns human_action_required and no page text when the page looks like a login or challenge, or when navigation leaves the confirmed origins.",
+        "Open a URL in that site's Chrome profile. The origin must already be human-confirmed for the site (login origin or a work origin). Re-resolves every A/AAAA and pins Chrome to one address from that checked set, then fails closed if the connected address is outside the set. Returns human_action_required and no page text when the page looks like a login or challenge, or when the final origin is not a confirmed login or work origin. Blocks subresource requests to link-local or metadata hosts.",
       inputSchema: {
         site: siteField,
         url: z.string().describe("Absolute http(s) URL on a confirmed origin for this site."),

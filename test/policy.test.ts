@@ -2,9 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   PolicyError,
+  assertAddressInResolvedSet,
+  assertNavigationPeer,
+  assertObservedPeer,
   assertOrigin,
   assertPinnedHost,
+  canonicalIp,
+  defaultResolveHost,
   hostResolverRules,
+  mappedPinAddress,
+  requestTargetsBlockedHost,
   elementIsChallenge,
   elementIsPassword,
   looksLikeChallengeWidget,
@@ -254,9 +261,26 @@ test("host resolver rules reject metadata addresses and pin one checked address"
       bad,
     );
   }
+  const many = ["203.0.113.9", "93.184.216.34", "2001:db8::2"];
   assert.equal(
-    hostResolverRules([{ hostname: "Example.COM", addresses: ["203.0.113.9", "93.184.216.34"] }]),
+    hostResolverRules([{ hostname: "Example.COM", addresses: many }]),
     "MAP example.com 93.184.216.34",
+  );
+  assert.equal(mappedPinAddress(many), "93.184.216.34");
+  assert.doesNotThrow(() => assertAddressInResolvedSet("93.184.216.34", many));
+  assert.doesNotThrow(() => assertAddressInResolvedSet("2001:0db8:0:0:0:0:0:2", many));
+  assert.throws(() => assertAddressInResolvedSet("198.51.100.4", many), /not in the resolved set/);
+  assert.doesNotThrow(() => assertObservedPeer(many, "203.0.113.9"));
+  assert.doesNotThrow(() => assertObservedPeer(many, "2001:db8::2"));
+  assert.throws(() => assertObservedPeer(many, "198.51.100.4"), /not in the resolved set/);
+  assert.throws(() => assertObservedPeer(many, null), /could not be checked/);
+  assert.doesNotThrow(() => assertObservedPeer(["93.184.216.34"], null));
+  assert.throws(
+    () => assertNavigationPeer([{ hostname: "example.com", addresses: many }], "https://example.com/app", "198.51.100.4"),
+    /not in the resolved set/,
+  );
+  assert.doesNotThrow(() =>
+    assertNavigationPeer([{ hostname: "example.com", addresses: many }], "https://cdn.example/app.js", "198.51.100.8"),
   );
   assert.equal(
     hostResolverRules([{ hostname: "v6.example", addresses: ["2001:db8::2"] }]),
@@ -270,4 +294,24 @@ test("host resolver rules reject metadata addresses and pin one checked address"
     ]),
     "MAP a.example 203.0.113.7, MAP b.example 203.0.113.8",
   );
+});
+
+test("DNS pin keeps every checked address and blocks metadata subresources only", async () => {
+  assert.equal(canonicalIp("2001:0db8:0000::0002"), "2001:db8::2");
+  assert.equal(canonicalIp("::1"), "::1");
+  assert.equal(canonicalIp("::"), "::");
+  assert.equal(canonicalIp("93.184.216.34"), "93.184.216.34");
+  const answers = await defaultResolveHost("localhost");
+  assert.ok(answers.includes("127.0.0.1") || answers.includes("::1"));
+  assert.equal(answers.some((address) => address === "169.254.169.254"), false);
+
+  assert.equal(requestTargetsBlockedHost("https://cdn.example/app.js"), false);
+  assert.equal(requestTargetsBlockedHost("https://accounts.example/oauth"), false);
+  assert.equal(requestTargetsBlockedHost("about:blank"), false);
+  assert.equal(requestTargetsBlockedHost("http://169.254.169.254/latest/meta-data"), true);
+  assert.equal(requestTargetsBlockedHost("http://metadata.google.internal/computeMetadata/v1/"), true);
+  assert.equal(requestTargetsBlockedHost("http://[fe80::1]/"), true);
+  assert.equal(requestTargetsBlockedHost("http://0.0.0.0/"), true);
+  assert.equal(requestTargetsBlockedHost("http://[::]/"), true);
+  assert.equal(requestTargetsBlockedHost("http://127.0.0.1/allow"), false);
 });

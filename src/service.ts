@@ -29,9 +29,12 @@ export interface SiteStatus {
   site: string;
   origins: string[];
   lastUsed: string | null;
+  lastConfirmed: string | null;
   session: SessionState;
+  /** Milliseconds since lastUsed, or since lastConfirmed when the site was never used. */
+  sessionAgeMs: number | null;
   profileExists: boolean;
-  /** One line: site id, confirmed origins, last used time, session. No secrets. */
+  /** One line: site id, origins, timestamps, session, age. No secrets. */
   line: string;
 }
 
@@ -170,13 +173,16 @@ export function createService(deps: {
     }
   }
 
-  function toStatus(record: SiteRecord): SiteStatus {
+  function toStatus(record: SiteRecord, now = Date.now()): SiteStatus {
     const session: SessionState = record.session === "needs_login" ? "needs_login" : "ok";
+    const sessionAgeMs = sessionAgeMsOf(record.lastUsed, record.lastConfirmed, now);
     const site: SiteStatus = {
       site: record.site,
       origins: record.origins,
       lastUsed: record.lastUsed,
+      lastConfirmed: record.lastConfirmed,
       session,
+      sessionAgeMs,
       profileExists: deps.browser.profileExists(record.site),
       line: "",
     };
@@ -201,7 +207,9 @@ export function createService(deps: {
             site: filter,
             origins: [],
             lastUsed: null,
+            lastConfirmed: null,
             session: "ok",
+            sessionAgeMs: null,
             profileExists: true,
             line: "",
           };
@@ -291,7 +299,7 @@ export function createService(deps: {
       try {
         const ordered = [primary, ...approved.filter((origin) => origin !== primary)];
         const origins = await deps.store.confirm(id, ordered);
-        await deps.store.touch(id);
+        await deps.store.touch(id, new Date(), undefined, { confirmed: true });
         return ok({ site: id, origin: primary, workOrigin: requested[1] ?? null, origins });
       } catch (error) {
         return browserFailure(error);
@@ -631,16 +639,32 @@ function validSelector(selector: string): boolean {
   return selector.length > 0 && selector.length <= SELECTOR_LIMIT;
 }
 
+export function sessionAgeMsOf(
+  lastUsed: string | null,
+  lastConfirmed: string | null,
+  now = Date.now(),
+): number | null {
+  const basis = lastUsed ?? lastConfirmed;
+  if (!basis) return null;
+  const parsed = Date.parse(basis);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, now - parsed);
+}
+
 export function formatSiteLine(input: {
   site: string;
   origins: readonly string[];
   lastUsed: string | null;
+  lastConfirmed: string | null;
   session: SessionState;
+  sessionAgeMs: number | null;
 }): string {
   const origins = input.origins.length > 0 ? input.origins.join(",") : "-";
   const lastUsed = input.lastUsed ?? "-";
+  const lastConfirmed = input.lastConfirmed ?? "-";
   const session = input.session === "needs_login" ? "needs_login" : "ok";
-  return `${input.site} origins=${origins} lastUsed=${lastUsed} session=${session}`;
+  const age = input.sessionAgeMs === null ? "-" : String(input.sessionAgeMs);
+  return `${input.site} origins=${origins} lastUsed=${lastUsed} lastConfirmed=${lastConfirmed} session=${session} age=${age}`;
 }
 
 function oneLine(value: string, limit: number): string {

@@ -7,10 +7,11 @@ import {
   scrubPublicText,
   type ElementFacts,
 } from "./policy.js";
-import { hostResolverRules, type HostPin } from "./policy.js";
+import { assertNavigationPeer, hostResolverRules, requestTargetsBlockedHost, type HostPin } from "./policy.js";
 import { resolveSitePaths } from "./site-path.js";
 import { preparePrivateDir } from "./session-path.js";
-import { createProfileVault, relockClosedSite } from "./vault.js";
+import { createProfileVault, relockClosedSite, sealLeftoverProfiles } from "./vault.js";
+import type { Response } from "playwright-core";
 
 export interface PageSignals {
   title: string;
@@ -88,6 +89,8 @@ export function createChromeBrowser(options: {
   let currentSite: string | null = null;
   let currentRules = "";
   let desiredRules = "";
+  let currentPins: readonly HostPin[] = [];
+  let desiredPins: readonly HostPin[] = [];
   // Bumped when this process closes Chrome on purpose, so the close hook does not
   // also lock. A user closing the window leaves the epoch unchanged and relocks.
   let epoch = 0;
@@ -95,6 +98,7 @@ export function createChromeBrowser(options: {
   const key = options.encryptionKey ?? null;
   const vault = createProfileVault(key);
   const secrets = key ? [key] : [];
+  sealLeftoverProfiles(vault, options.dataDir);
 
   function profileExists(site: string): boolean {
     try {
@@ -140,6 +144,7 @@ export function createChromeBrowser(options: {
     context = null;
     currentSite = null;
     currentRules = "";
+    currentPins = [];
     await closing.close().catch(() => undefined);
     if (relock && previous) lockProfile(previous, "browser_closed");
   }
@@ -150,6 +155,7 @@ export function createChromeBrowser(options: {
         context = null;
         currentSite = null;
         currentRules = "";
+        currentPins = [];
       }
       // SIGKILL cannot reach this hook. Only a real browser close does.
       if (epoch !== epochAtLaunch) return;
@@ -162,6 +168,8 @@ export function createChromeBrowser(options: {
     const connected = context?.browser()?.isConnected() === true;
     if (connected && currentSite === site && currentRules === desired) {
       desiredRules = desired;
+      desiredPins = pins;
+      currentPins = pins;
       return;
     }
     if (connected && currentSite === site && !relaunch) {
@@ -175,6 +183,7 @@ export function createChromeBrowser(options: {
       await shutdownContext(currentSite !== site);
     }
     desiredRules = desired;
+    desiredPins = pins;
   }
 
   async function ensureContext(site: string): Promise<BrowserContext> {
@@ -184,6 +193,7 @@ export function createChromeBrowser(options: {
     if (context) {
       await shutdownContext(currentSite !== site);
     }
+    sealLeftoverProfiles(vault, options.dataDir);
     const paths = resolveSitePaths(options.dataDir, site);
     vault.unlockSite(options.dataDir, site);
     preparePrivateDir(paths.profile);
@@ -207,12 +217,25 @@ export function createChromeBrowser(options: {
       context = null;
       currentSite = null;
       currentRules = "";
+      currentPins = [];
       lockProfile(site, "browser_closed");
       throw new Error(explainLaunchError(error, secrets));
     }
     context = launched;
     currentSite = site;
     currentRules = rulesAtLaunch;
+    currentPins = desiredPins;
+    await launched.route("**/*", async (route) => {
+      try {
+        if (requestTargetsBlockedHost(route.request().url())) {
+          await route.abort("blockedbyclient");
+          return;
+        }
+        await route.continue();
+      } catch {
+        await route.abort("blockedbyclient").catch(() => undefined);
+      }
+    });
     launched.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
     launched.setDefaultTimeout(ACTION_TIMEOUT_MS);
     watchContext(launched, site, epochAtLaunch);
@@ -223,6 +246,7 @@ export function createChromeBrowser(options: {
       context = null;
       currentSite = null;
       currentRules = "";
+      currentPins = [];
       await launched.close().catch(() => undefined);
       lockProfile(site, "browser_closed");
       throw new Error("Chrome profile directory could not be kept private.");
@@ -309,12 +333,14 @@ export function createChromeBrowser(options: {
       async login(url: string, confirmUrl?: string) {
         const ctx = await ensureContext(site);
         const page = await getPage(ctx);
-        await page
+        const response = await page
           .goto(url, { waitUntil: "domcontentloaded", timeout: LOGIN_NAV_TIMEOUT_MS })
           .catch((error: unknown) => {
             const message = error instanceof Error ? error.message : String(error);
             if (!/timeout/i.test(message)) throw error;
+            return null;
           });
+        await assertPeerOrBlank(page, response, currentPins);
         if (!confirmUrl) return;
         try {
           const extra = await ctx.newPage();
@@ -326,7 +352,8 @@ export function createChromeBrowser(options: {
       },
       async open(url: string) {
         const page = await getPage(await ensureContext(site));
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+        const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+        await assertPeerOrBlank(page, response, currentPins);
         return signals(page);
       },
       async inspect() {
@@ -406,6 +433,21 @@ export function createChromeBrowser(options: {
       });
     },
   };
+}
+
+async function assertPeerOrBlank(page: Page, response: Response | null, pins: readonly HostPin[]): Promise<void> {
+  let remote: string | null = null;
+  if (response) {
+    const addr = await response.serverAddr().catch(() => null);
+    remote = addr?.ipAddress ?? null;
+  }
+  try {
+    assertNavigationPeer(pins, page.url(), remote);
+  } catch (error) {
+    await page.goto("about:blank", { timeout: 5000 }).catch(() => undefined);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new DnsPinError(message);
+  }
 }
 
 function trimText(text: string, limit: number): { text: string; truncated: boolean } {

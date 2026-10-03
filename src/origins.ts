@@ -17,6 +17,8 @@ export interface OriginRecord {
 export interface SiteRecord extends OriginRecord {
   site: string;
   lastUsed: string | null;
+  /** When auth_confirm last succeeded. Not updated by later reads. */
+  lastConfirmed: string | null;
   session: SessionState;
 }
 
@@ -25,7 +27,7 @@ export interface OriginStore {
   has(site: string, origin: string): Promise<boolean>;
   /** First origin is the login origin. Later origins are work origins. */
   confirm(site: string, origins: string[]): Promise<string[]>;
-  touch(site: string, when?: Date, session?: SessionState): Promise<string>;
+  touch(site: string, when?: Date, session?: SessionState, options?: { confirmed?: boolean }): Promise<string>;
 }
 
 const MAX_ORIGINS = 1000;
@@ -105,12 +107,14 @@ export function parseSessionState(value: unknown): SessionState {
   return value === "needs_login" ? "needs_login" : "ok";
 }
 
-async function readMeta(file: string): Promise<{ lastUsed: string | null; session: SessionState }> {
+async function readMeta(file: string): Promise<{ lastUsed: string | null; lastConfirmed: string | null; session: SessionState }> {
   const parsed = await readPrivateJson(file);
-  if (!parsed || typeof parsed !== "object") return { lastUsed: null, session: "ok" };
-  const value = (parsed as { lastUsed?: unknown }).lastUsed;
-  const lastUsed = typeof value === "string" && LAST_USED.test(value) ? value : null;
-  return { lastUsed, session: parseSessionState((parsed as { session?: unknown }).session) };
+  if (!parsed || typeof parsed !== "object") return { lastUsed: null, lastConfirmed: null, session: "ok" };
+  const body = parsed as { lastUsed?: unknown; lastConfirmed?: unknown; session?: unknown };
+  const lastUsed = typeof body.lastUsed === "string" && LAST_USED.test(body.lastUsed) ? body.lastUsed : null;
+  const lastConfirmed =
+    typeof body.lastConfirmed === "string" && LAST_USED.test(body.lastConfirmed) ? body.lastConfirmed : null;
+  return { lastUsed, lastConfirmed, session: parseSessionState(body.session) };
 }
 
 export function createFileStore(dataDir: string): OriginStore {
@@ -127,6 +131,7 @@ export function createFileStore(dataDir: string): OriginStore {
           workOrigins: record.workOrigins,
           origins: record.origins,
           lastUsed: meta.lastUsed,
+          lastConfirmed: meta.lastConfirmed,
           session: meta.session,
         });
       }
@@ -164,13 +169,14 @@ export function createFileStore(dataDir: string): OriginStore {
         return all;
       });
     },
-    async touch(site: string, when: Date = new Date(), session?: SessionState) {
+    async touch(site: string, when: Date = new Date(), session?: SessionState, options?: { confirmed?: boolean }) {
       const paths = await ensureSite(dataDir, site);
       const lastUsed = when.toISOString();
       await siteLock(paths.root)(async () => {
         const prev = await readMeta(paths.meta);
         const next = session === "needs_login" || session === "ok" ? session : prev.session;
-        await writePrivateJson(paths.meta, { lastUsed, session: next });
+        const lastConfirmed = options?.confirmed ? lastUsed : prev.lastConfirmed;
+        await writePrivateJson(paths.meta, { lastUsed, lastConfirmed, session: next });
       });
       return lastUsed;
     },
